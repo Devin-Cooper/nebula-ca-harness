@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""box/handlers/backup-ca -- the "backup-ca" vetted handler. Produces an
+age-encrypted `ca.key.age`
+the operator can carry OFF the box for disaster recovery (see
+recovery-kit/RECOVERY-CEREMONY.md's "Lost every signer key" ceremony) --
+the whole point being that the ENCRYPTED blob is safe to leave the box
+while the PLAINTEXT `ca.key` never does. A standalone, extensionless
+script (like box/handlers/ca-bootstrap/sign-hosts before it), installed to
+`config.HANDLERS_DIR` (or run straight out of a repo checkout's
+`box/handlers/`) and invoked by `causb.dispatch` as `backup-ca <job.json>
+<payload_dir> <out_dir>` -- the same uniform vetted-handler argv contract
+every other handler gets. `job.json` here is `causb.manifest.parse()`'s
+single `jobs[0]` dict (job_id/operation/args/payload), NOT the full
+manifest wrapper -- see box/handlers/ca-bootstrap's own module docstring,
+which documents this identically.
+
+**Box-pinned recipient ONLY -- a job manifest's `args` are never consulted
+for anything.** The spec is explicit: "IGNORE any recipient in the
+manifest (box-pinned only) -- a job cannot redirect the backup to an
+attacker's key." Rather than reading `job["args"]["recipient"]` and then
+discarding it (which would still leave a code path that COULD be wired up
+wrong later), this handler never inspects `job` at all -- `run()`'s very
+first statement is `del job, payload_dir`, exactly mirroring
+`box/handlers/status`'s identical "accepted, unused, purely for argv-
+contract uniformity" stance. The recipient is always `recipient_path` (a
+DI seam; production `config.BACKUP_RECIPIENT`, a file `box/install.sh`
+places at `/etc/nebula-ca/backup-recipient.age`, root-owned, NOT
+attacker-writable by anything a job bundle controls) -- there is
+structurally nothing a manifest could do to change which key this backup
+is encrypted against.
+
+**Not-bootstrapped guard, checked FIRST -- then no_recipient.** Mirrors
+`sign-hosts`'s identical "check identity before touching anything else"
+ordering: `os.path.isfile(ca_dir/ca.key)` before the recipient file is even
+looked at, so a box with BOTH missing reports `not_bootstrapped` (the more
+fundamental problem), not `no_recipient`.
+
+**`age` invocation: list-argv, timeout, control-char guard, error mapping
+-- the same discipline as `causb.nebulacli`'s wrapper over `nebula-cert`,
+deliberately duplicated locally rather than imported.** There is no shared
+`causb.agecli` module (`age`
+is a genuinely different external tool than `nebula-cert` with its own
+tiny surface -- one subcommand-less invocation, three flags), so
+`AgeError`/`_check_clean`/`_age_encrypt` below are a self-contained copy of
+`causb.nebulacli`'s exact pattern: list-argv only (never `shell=True`),
+every argv element checked for an embedded control character BEFORE any
+subprocess is spawned, and every operational failure (nonzero exit,
+timeout, missing binary) collapsed into `AgeError` with one of the three
+fixed reason strings tests/callers key off of. Raw stderr is never
+included in the exception message, for the same reason `causb.nebulacli`
+never includes it: a caller that logs or surfaces an `AgeError` can never
+leak `age`'s raw diagnostic text.
+
+**Plaintext `ca.key` NEVER written to `out_dir` -- by construction, not by
+filtering.** The only file this module ever writes under `out_dir` is the
+single, explicitly-named `ca.key.age` that `age_run` itself populates (via
+its `-o` flag) -- `ca_dir` is never listed, globbed, or copied wholesale
+(mirrors `ca-bootstrap`/`sign-hosts`'s identical strict-allowlist
+discipline). `ca.key` is opened by nothing in this file except to pass its
+PATH as `age_run`'s third positional argument; its bytes are never read
+into this process at all (the real `age` binary reads the plaintext
+itself, deliberately keeping it out of this Python process's memory too).
+
+**Fail-closed cleanup of a partial ciphertext.** If `age_run` raises
+`AgeError` AFTER having already written some bytes to `out_path` (e.g. a
+real `age` process that produced partial output before timing out or being
+killed), that partial file is removed before returning -- a failed backup
+must never leave something that LOOKS like a usable `ca.key.age` sitting
+in `out_dir`. Mirrors `ca-bootstrap`'s identical "no wedge, no partial
+artifact" fail-closed stance (see that module's own docstring).
+
+**Sanity check on `age_run`'s own success claim.** After a successful (non-
+raising) `age_run` call, this handler additionally confirms `out_path`
+actually exists before reporting `EXIT_OK` -- a defensive backstop against
+a misbehaving `age_run` (or a future refactor) that reports success
+without truly producing output, so this handler never claims a backup
+succeeded when `out_dir` doesn't actually hold one.
+
+**Exit codes / reason vocabulary.** `EXIT_OK` (0), `EXIT_FAULT` (1 --
+CLI-invocation misuse, unreachable in production since `causb.dispatch`
+always supplies the fixed 4-element argv), `EXIT_BAD_MANIFEST` (2 -- only
+reachable via `main()`'s own unparseable-job.json guard; `run()` itself
+never inspects `job` so it can never produce this on its own),
+`EXIT_NOT_BOOTSTRAPPED` (3), `EXIT_NO_RECIPIENT` (4), `EXIT_AGE_FAILED`
+(5), `EXIT_TIMEOUT` (6), `EXIT_TOOL_MISSING` (7), `EXIT_WRITE_FAILED` (8 --
+belt-and-suspenders only: `age_run` succeeding but leaving no file behind,
+or a stray OSError). Only the harness's own "any handler exit != 0 maps to
+handler_failed at the dispatch layer" contract is load-bearing; the
+specific small distinct integers exist for anyone reading a log, mirroring
+every other handler's identical stance on its own exit codes.
+"""
+
+import json
+import os
+import subprocess
+import sys
+
+# APPEND (not insert(0)): see box/handlers/ca-bootstrap's identical comment
+# for the full reasoning -- an explicit PYTHONPATH (e.g. this repo's own
+# unit tests, or the on-box test runner) must be honoured rather than
+# shadowed by a possibly-stale installed copy.
+sys.path.append("/usr/local/lib")
+
+from causb import config  # noqa: E402  (see sys.path.append above)
+
+EXIT_OK = 0
+EXIT_FAULT = 1  # CLI-invocation misuse (wrong argc) -- mirrors ca-bootstrap's
+                # EXIT_FAULT; should never happen in production.
+EXIT_BAD_MANIFEST = 2
+EXIT_NOT_BOOTSTRAPPED = 3
+EXIT_NO_RECIPIENT = 4
+EXIT_AGE_FAILED = 5
+EXIT_TIMEOUT = 6
+EXIT_TOOL_MISSING = 7
+EXIT_WRITE_FAILED = 8
+
+_REASON_BY_EXIT = {
+    EXIT_FAULT: "fault",
+    EXIT_BAD_MANIFEST: "bad_manifest",
+    EXIT_NOT_BOOTSTRAPPED: "not_bootstrapped",
+    EXIT_NO_RECIPIENT: "no_recipient",
+    EXIT_AGE_FAILED: "age_failed",
+    EXIT_TIMEOUT: "timeout",
+    EXIT_TOOL_MISSING: "tool_missing",
+    EXIT_WRITE_FAILED: "write_failed",
+}
+
+# AgeError.reason -> EXIT_* (module docstring's exit-code section).
+_EXIT_BY_AGE_REASON = {
+    "age_failed": EXIT_AGE_FAILED,
+    "timeout": EXIT_TIMEOUT,
+    "tool_missing": EXIT_TOOL_MISSING,
+}
+
+_CONTROL_CHARS = frozenset(chr(c) for c in range(0x20)) | {chr(0x7F)}
+
+
+class AgeError(Exception):
+    """An `age` invocation failed. `reason` is one of the fixed enum
+    strings "age_failed" | "timeout" | "tool_missing" -- mirrors
+    `causb.nebulacli.NebulaError`'s identical contract (module docstring);
+    duplicated locally rather than imported since `age` has no shared
+    wrapper module in this codebase.
+    """
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _check_clean(argv):
+    """Reject any argv element containing an embedded control character
+    (NUL, C0, or DEL) BEFORE exec. Raises a plain ValueError -- a caller/
+    programming bug, never an age operational failure (it never got to
+    run) -- verbatim-equivalent of causb.nebulacli._check_clean."""
+    for arg in argv:
+        if any(ch in _CONTROL_CHARS for ch in arg):
+            raise ValueError(f"argument contains a control character: {arg!r}")
+
+
+def _age_encrypt(recipient_path, in_path, out_path, *, runner=subprocess.run, timeout=config.OP_TIMEOUT_S):
+    """Run `age -R <recipient_path> -o <out_path> <in_path>` to encrypt
+    `in_path` against every recipient listed in `recipient_path` (module
+    docstring's "age invocation" section). `age` itself is invoked as a
+    bare command name (PATH-resolved), matching causb.nebulacli's identical
+    tool-invocation style.
+
+    Raises `AgeError` on any nonzero exit, timeout, or missing binary.
+    Returns None on success (age writes `out_path` itself; nothing is read
+    back here, and the plaintext `in_path` is never opened by this
+    process).
+    """
+    argv = ["age", "-R", recipient_path, "-o", out_path, in_path]
+    _check_clean(argv)
+    try:
+        result = runner(
+            argv,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise AgeError("timeout")
+    except FileNotFoundError:
+        raise AgeError("tool_missing")
+    if result.returncode != 0:
+        raise AgeError("age_failed")
+    return None
+
+
+def _silent_remove(path):
+    """Best-effort unlink of `path`, ignoring a missing file or any OSError
+    -- used to restore "nothing was written" after a failed age_run
+    (module docstring's "fail-closed cleanup" section). Mirrors
+    ca-bootstrap's identical `_silent_remove` helper (duplicated locally
+    per this project's established per-module convention)."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def run(job, payload_dir, out_dir, *, ca_dir=config.CA_DIR,
+        recipient_path=config.BACKUP_RECIPIENT, age_run=_age_encrypt):
+    """Handler entrypoint body. `job`/`payload_dir` are
+    accepted, unused, purely for argv-contract uniformity AND to guarantee
+    a manifest-supplied recipient can have zero effect (module docstring's
+    "box-pinned recipient ONLY" section) -- there is no code path here that
+    ever reads `job["args"]`. `ca_dir`/`recipient_path`/`age_run` are DI
+    seams (mirrors `ca-bootstrap`/`sign-hosts`'s identical convention):
+    production calls (the `__main__` shim below) use the real
+    `config.CA_DIR`/`config.BACKUP_RECIPIENT`/this module's own
+    `_age_encrypt`; tests point all three at tmpdirs + a fake recorder.
+
+    Returns one of the `EXIT_*` codes above; never raises for any
+    foreseeable failure (`AgeError`, `OSError`) -- see module docstring.
+    """
+    del job, payload_dir  # contract uniformity + "manifest never consulted"; see docstring
+
+    ca_key_path = os.path.join(ca_dir, "ca.key")
+
+    # 1. Not-bootstrapped guard -- FIRST, before the recipient is even
+    # looked at (module docstring: "the more fundamental problem").
+    if not os.path.isfile(ca_key_path):
+        return EXIT_NOT_BOOTSTRAPPED
+
+    # 2. Recipient file must exist and be non-empty (module docstring /
+    # spec: "absent/empty"). os.path.isfile is False for a missing path OR
+    # a directory in its place, so both fold into no_recipient.
+    if not os.path.isfile(recipient_path) or os.path.getsize(recipient_path) == 0:
+        return EXIT_NO_RECIPIENT
+
+    out_path = os.path.join(out_dir, "ca.key.age")
+    try:
+        age_run(recipient_path, ca_key_path, out_path)
+    except AgeError as exc:
+        _silent_remove(out_path)  # no partial ciphertext left behind
+        return _EXIT_BY_AGE_REASON.get(exc.reason, EXIT_AGE_FAILED)
+    except OSError:
+        _silent_remove(out_path)
+        return EXIT_WRITE_FAILED
+
+    # Defensive backstop (module docstring): age_run reported success but
+    # somehow produced nothing -- fail closed rather than claim EXIT_OK.
+    if not os.path.isfile(out_path):
+        return EXIT_WRITE_FAILED
+
+    return EXIT_OK
+
+
+def main(argv):
+    if len(argv) != 4:
+        print(f"usage: {argv[0]} <job.json> <payload_dir> <out_dir>", file=sys.stderr)
+        return EXIT_FAULT
+    _, job_path, payload_dir, out_dir = argv
+
+    try:
+        with open(job_path, "rb") as f:
+            job = json.loads(f.read())
+    except (OSError, ValueError):
+        print("backup-ca: bad_manifest", file=sys.stderr)
+        return EXIT_BAD_MANIFEST
+    if not isinstance(job, dict):
+        print("backup-ca: bad_manifest", file=sys.stderr)
+        return EXIT_BAD_MANIFEST
+
+    try:
+        rc = run(job, payload_dir, out_dir)
+    except OSError as exc:
+        # Mirrors ca-bootstrap's identical outer safety net: run() is
+        # designed to catch every foreseeable OSError itself, so this is
+        # belt-and-suspenders, not the primary contract.
+        print(f"backup-ca: fault: {exc}", file=sys.stderr)
+        return EXIT_WRITE_FAILED
+
+    if rc != EXIT_OK:
+        print(f"backup-ca: {_REASON_BY_EXIT.get(rc, 'fault')}", file=sys.stderr)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

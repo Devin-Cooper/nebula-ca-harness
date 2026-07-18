@@ -1,0 +1,666 @@
+#!/usr/bin/env python3
+"""box/handlers/rotate-ca -- the "rotate-ca" vetted handler (the final and
+most complex CA operation). It mints a
+BRAND NEW ca.key/ca.crt ON THE BOX (via `causb.nebulacli.ca`, v1), re-signs
+every existing host under the new CA (via `causb.nebulacli.sign`), emits an
+old+new trust bundle (the transition `pki.ca`) and -- in compromise mode -- a
+nebula blocklist of the OLD leaf fingerprints, then ATOMICALLY swaps the new CA
+in and SECURELY DESTROYS the old ca.key. A standalone, extensionless script
+(like box/handlers/ca-bootstrap/sign-hosts before it), installed to
+`config.HANDLERS_DIR` (or run straight out of a repo checkout's
+`box/handlers/`) and invoked by `causb.dispatch` as `rotate-ca <job.json>
+<payload_dir> <out_dir>` -- the same uniform vetted-handler argv contract every
+other handler gets. `job.json` here is `causb.manifest.parse()`'s single
+`jobs[0]` dict (job_id/operation/args/payload/seq), NOT the full manifest
+wrapper -- see box/handlers/ca-bootstrap's own module docstring, which
+documents this identically.
+
+**Wedge-safety is THE load-bearing property, and it drives the whole
+control-flow shape: build EVERYTHING to temp / out_dir first, SWAP LAST.**
+Every artifact -- the new ca.key/ca.crt (written to `ca.key.new`/`ca.crt.new`
+temp paths inside ca_dir), every re-signed host cert, the trust bundle, the
+compromise blocklist, the receipt -- is produced BEFORE a single destructive
+change is made to the on-box CA. The "commit point" (Phase B below) is a tight
+sequence of near-infallible same-filesystem `os.replace` renames. Any failure
+BEFORE that point (a bad manifest, a `nebula-cert` nonzero exit, a re-sign
+failure on host N of M, an OSError writing a temp) returns nonzero with the
+OLD ca.key/ca.crt/registry.json BYTE-for-BYTE unchanged -- the box is left
+exactly as it was and the whole job is safely re-runnable. `out_dir` may hold
+partial public certs from a failed run; that is fine -- the harness discards
+`out_dir` on any nonzero handler exit, so only the on-box CA state
+has a "nothing partial, ever" requirement, and that is what Phase B protects
+(mirrors sign-hosts' identical reserve-then-commit stance).
+
+**Securely destroying the OLD ca.key without ever COPYING it, AND without ever
+leaving the box keyless (retained-fd shred-after-atomic-replace).** The spec's
+literal prose overwrites the old key IN PLACE and THEN `os.replace`s the new
+key over it. That shreds correctly but opens a real keyless WEDGE window: once
+the old key's bytes are zeroed, if the subsequent rename fails the box has NO
+usable key at all -- directly at odds with this handler's paramount wedge-safety
+goal. This handler instead achieves the identical end state (the old key's
+inode bytes overwritten in place, never copied anywhere) with NO keyless
+window, by:
+  1. opening the live old `ca.key` (O_RDWR) and holding that fd, BEFORE the
+     swap (the inode is still reachable through it after it is unlinked);
+  2. `os.replace(ca.key.new -> ca.key)` -- ATOMIC: from this instant the box
+     always has a fully-valid NEW key at `ca.key`; the OLD key's directory
+     entry is gone but its inode persists, pinned open by the retained fd;
+  3. overwriting that now-unlinked inode's bytes through the retained fd
+     (`os.urandom` over its whole length) + `os.fsync`, then closing the fd,
+     which frees the (now-shredded) inode.
+So the old key's bytes are overwritten on their original blocks (the same
+"shred in place" the spec intends), the old key is NEVER copied to a second
+location (which would only spread the secret), and the box is never keyless
+even if a rename mid-swap were to fail. On a journaling / copy-on-write
+filesystem an in-place overwrite is best-effort against raw-disk forensics (the
+fs may write the new bytes to fresh blocks); that caveat is inherent to any
+in-process shred. Unit tests cannot observe an unlinked inode's raw blocks, so they prove
+the weaker, checkable guarantee instead: after a rotate, ca.key holds the NEW
+bytes and the OLD key's bytes appear in NO named file under ca_dir or out_dir.
+
+**`ca.key` -- OLD or NEW -- NEVER reaches out_dir, by construction.** The only
+files this module ever writes under `out_dir` are, by an explicit allowlist
+(never a directory sweep or copytree of ca_dir): each re-signed host's
+`<name>.crt` (written directly by `nebula_sign`'s own `out_crt=`), one
+`alloc-<name>.json` per host, the `ca-bundle.crt` trust bundle (old++new PUBLIC
+certs), `rotate-receipt.json`, and -- only in compromise mode -- `blocklist.json`.
+The new ca.key exists only at `ca.key.new`/`ca.key` inside ca_dir; the old key
+only ever inside ca_dir. Neither is opened for reading into this process at
+all (the new key's PATH is passed to `nebula_sign` as `-ca-key`; nebula-cert
+reads it itself). The raw new/old ca.crt is likewise never written to out_dir
+as a standalone file -- only inside the (public) bundle. Mirrors
+ca-bootstrap/sign-hosts' identical strict-allowlist discipline;
+`TestNoKeyReachesOutDir` proves it mutation-proof against a "sweep everything"
+bug for BOTH keys at once.
+
+**Re-signing reads pubkeys from the REGISTRY, not the stick (payload_dir
+unused).** A rotate must re-sign the ENTIRE existing fleet, and the operator
+does not re-submit every host's `.pub` on the stick to do it -- so `pubkey`
+(the full base64-encoded public key `causb.registry.record` has stored
+alongside `pubkey_sha256`) is decoded straight out
+of each registry host entry, written to a throwaway `.pub` in a scratch dir
+under ca_dir (public data; cleaned up in a `finally`), and handed to
+`nebula_sign` against the NEW CA. A host whose registry entry LACKS a usable
+`pubkey` (a legacy record predating pubkey storage, or a partial `allocate()` entry) cannot be
+re-signed by this box alone -- it is added to the receipt's `skipped[]` and
+left untouched (the operator re-runs sign-hosts for it with its `.pub`). A
+registry with ZERO hosts is NOT an error: a CA with no hosts is still rotated
+(new key/crt swapped, bundle written, nothing to re-sign).
+
+**Every re-signed cert keeps the host's identity EXACTLY: same name, same
+stable IP (`f"{ip}/16"`, the box's one overlay width -- never re-derived from a
+parsed prefix), same pubkey, same groups.** Only the signing CA (and therefore
+the fingerprint / notAfter) changes. The in-memory registry is updated with
+each host's NEW fingerprint/notAfter (ip + pubkey carried through untouched via
+`registry.record`) and persisted with a single `registry.save` AFTER the CA
+swap commits. Each host also gets a committed `alloc-<name>.json`
+(`registry.allocation_record`) carrying its pubkey + new fingerprint, with a
+distinct per-host `seq = job_seq*1000 + index` (index = 0-based position in the
+deterministic sorted-by-name order) -- the identical within-job tiebreak scheme
+sign-hosts uses, so `causb.registry.reconcile()`'s replay order stays total.
+
+**The compromise blocklist is the nebula `pki.blocklist`, verified against the
+box's real nebula 1.10.3.** Researched live on the box + against nebula's
+source (`pki.go`: `bl := c.GetStringSlice("pki.blocklist", ...)` -> each entry
+`caPool.BlocklistFingerprint(fp)`): `pki.blocklist` is a plain `[]string` of
+certificate fingerprint hex strings -- exactly the `fingerprint` value
+`nebula-cert print -json` returns and `causb.registry` stores per host. So
+`blocklist.json` is emitted as the exact nebula config fragment
+`{"pki": {"blocklist": [<old leaf fingerprint>, ...]}}` (JSON, which is valid
+YAML, so it drops straight into a nebula config / config.d) listing every
+host's OLD (pre-rotation) leaf fingerprint captured BEFORE re-signing --
+INCLUDING skipped hosts (a compromised old cert must be refused even for a host
+this box cannot re-sign). Fingerprints are de-duplicated and sorted for a
+deterministic artifact. Only compromise mode emits it (a routine rotation trusts
+the old CA through the bundle during rollout and blocks nothing).
+
+**Exit codes / reason vocabulary.** `EXIT_OK` (0), `EXIT_FAULT` (1 --
+CLI-invocation misuse, unreachable in production since `causb.dispatch` always
+supplies the fixed 4-element argv), `EXIT_BAD_MANIFEST` (2),
+`EXIT_NOT_BOOTSTRAPPED` (3), `EXIT_NEBULA_FAILED` (4), `EXIT_WRITE_FAILED` (5 --
+also covers a corrupt/unparseable on-disk registry.json, which has no dedicated
+slot in the spec's fixed `{not_bootstrapped, bad_manifest, nebula_failed,
+write_failed}` reason vocabulary). Only the harness's own "any handler exit !=
+0 maps to handler_failed at the dispatch layer" contract is load-bearing; the
+specific small distinct integers exist for anyone reading a log, mirroring every
+other handler's identical stance.
+"""
+
+import base64
+import binascii
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+
+# APPEND (not insert(0)): see box/handlers/ca-bootstrap's identical comment for
+# the full reasoning -- an explicit PYTHONPATH (e.g. this repo's own unit
+# tests, or the on-box test runner) must be honoured rather than shadowed by a
+# possibly-stale installed copy.
+sys.path.append("/usr/local/lib")
+
+from causb import config, nebulacli, registry  # noqa: E402  (see sys.path.append above)
+
+EXIT_OK = 0
+EXIT_FAULT = 1  # CLI-invocation misuse (wrong argc) -- mirrors ca-bootstrap's
+                # EXIT_FAULT; should never happen in production.
+EXIT_BAD_MANIFEST = 2
+EXIT_NOT_BOOTSTRAPPED = 3
+EXIT_NEBULA_FAILED = 4
+EXIT_WRITE_FAILED = 5
+
+_REASON_BY_EXIT = {
+    EXIT_FAULT: "fault",
+    EXIT_BAD_MANIFEST: "bad_manifest",
+    EXIT_NOT_BOOTSTRAPPED: "not_bootstrapped",
+    EXIT_NEBULA_FAILED: "nebula_failed",
+    EXIT_WRITE_FAILED: "write_failed",
+}
+
+_DEFAULT_CA_NAME = "nebula-ca"
+_CA_CURVE = "25519"
+# ALWAYS explicit. `nebula-cert ca` silently DEFAULTS to -version 2 if
+# omitted; a v2 CA would break the mixed/Android fleet. A manifest may override
+# name/duration/host_duration, but NEVER the CA's wire cert version. Asserted
+# by the test suite directly (mirrors ca-bootstrap's identical pin).
+_CA_VERSION = "1"
+
+# The box's one supported overlay shape: every re-signed cert's `-networks` is
+# built unconditionally at this width (mirrors sign-hosts' `_FORCED_PREFIXLEN`),
+# never re-derived from whatever prefix the registry's ip string parsed to.
+_FORCED_PREFIXLEN = 16
+
+# Within-job seq tiebreak multiplier (mirrors sign-hosts): comfortably larger
+# than config.CAPS["payload_files"] and any realistic fleet size, so per-host
+# indices from one rotate can never collide with the next job_seq's base value.
+_SEQ_TIEBREAK_MULTIPLIER = 1000
+
+# Temp (pre-swap) paths for the freshly-minted CA, inside ca_dir so the final
+# os.replace is a same-filesystem atomic rename. Their basenames are also the
+# ones cleaned up on every failure path.
+_TMP_NEW_CRT = "ca.crt.new"
+_TMP_NEW_KEY = "ca.key.new"
+
+# Host names whose re-signed `<name>.crt` would collide with a fixed out_dir
+# deliverable this handler owns. Only "ca-bundle" collides (-> ca-bundle.crt);
+# sign-hosts already forbids "ca"/"registry", and "rotate-receipt"/"blocklist"
+# hosts would produce `.crt` files distinct from this handler's `.json`
+# deliverables. Such a host is SKIPPED (recorded in the receipt) rather than
+# silently overwriting -- or being overwritten by -- the trust bundle. Compared
+# case-insensitively (the vfat delivery stick is case-insensitive, mirroring
+# sign-hosts' `_RESERVED_NAMES` note).
+_RESERVED_CERT_STEMS = frozenset({"ca-bundle"})
+
+
+def _is_clean_str(value):
+    """True if `value` is a string with no control character (NUL, C0
+    0x00-0x1f, or DEL 0x7f) -- verbatim copy of ca-bootstrap/sign-hosts' helper
+    (this project's established per-module self-contained-duplication
+    convention; see causb/registry.py's docstring for the rationale)."""
+    if not isinstance(value, str):
+        return False
+    return not any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in value)
+
+
+def _is_safe_basename(value):
+    """True if `value` is a non-empty, control-char-free string safe as a
+    SINGLE path component: no "/", not "."/"..". Verbatim copy of sign-hosts'
+    helper -- applied to every host `name` this handler joins into an out_dir /
+    scratch path, so a corrupt registry key cannot escape either directory."""
+    if not _is_clean_str(value) or not value:
+        return False
+    if "/" in value or value in (".", ".."):
+        return False
+    return True
+
+
+def _is_valid_duration(value):
+    """True if `value` is a non-empty, control-char-free duration string with
+    at least one genuinely non-zero numeric component and no leading `-`
+    (verbatim copy of sign-hosts' helper). Rejects unbounded-by-omission ("",
+    "0", "0h0m0s") and negative durations for BOTH the new CA cert and the
+    re-signed host certs -- a never-expiring cert is a policy violation this
+    handler refuses to produce. nebula-cert itself remains the final arbiter of
+    a syntactically-weird-but-plausible string (a genuinely malformed one
+    surfaces as NebulaError -> nebula_failed, still fail-closed)."""
+    if not _is_clean_str(value) or not value.strip():
+        return False
+    if "-" in value:
+        return False
+    numbers = re.findall(r"\d+(?:\.\d+)?", value)
+    if not numbers:
+        return False
+    return any(float(n) != 0 for n in numbers)
+
+
+def _fsync_dir(path):
+    """Verbatim copy of causb.registry._fsync_dir / ca-bootstrap._fsync_dir
+    (each module's durable-write helper stays local/self-contained, per this
+    project's established convention)."""
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_file(path):
+    """fsync a regular file's data by path -- valid even via a fresh read-only
+    fd, since fsync operates on the underlying inode/data independent of which
+    fd/mode opened it (verbatim copy of ca-bootstrap._fsync_file)."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _silent_remove(*paths):
+    """Best-effort unlink of every path, ignoring a missing file or any OSError
+    (mirrors ca-bootstrap's helper) -- used to restore "nothing partial" on the
+    failure branches below."""
+    for p in paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def _shred_remove(path):
+    """Best-effort overwrite-then-unlink of a TEMP new-CA private key that
+    never went live (`ca.key.new`), on a failure path. Defense-in-depth: the
+    temp new key is a real private key, so its bytes are overwritten before the
+    unlink rather than merely unlinked (which would leave the bytes on disk).
+    Distinct from the LIVE old-key shred in Phase B (which must not copy and
+    must not wedge); this one is a throwaway candidate, so a plain
+    overwrite+unlink is sufficient. Never raises."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    try:
+        fd = os.open(path, os.O_WRONLY)
+        try:
+            if size:
+                os.write(fd, os.urandom(size))
+                os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+    _silent_remove(path)
+
+
+def _atomic_write_bytes(path, data, mode):
+    """tmp sibling -> write -> fsync fd -> chmod -> os.replace into place ->
+    fsync parent dir (this project's durable-write idiom; see
+    causb.registry._atomic_write / ca-bootstrap). Used for the on-box durable
+    public artifacts (archived old ca.crt, on-box ca-bundle.crt)."""
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        _silent_remove(tmp)
+        raise
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+    _fsync_dir(os.path.dirname(path))
+
+
+def _decode_pubkey(host):
+    """Return the host's stored public-key BYTES, or None if it has no usable
+    `pubkey` (absent, non-string, control-char-tainted, or not valid base64).
+    A host without a usable pubkey cannot be re-signed by this box alone -- the
+    caller records it in `skipped[]` rather than failing the whole rotation."""
+    pubkey_b64 = host.get("pubkey")
+    if not _is_clean_str(pubkey_b64) or not pubkey_b64:
+        return None
+    try:
+        return base64.b64decode(pubkey_b64, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+
+def _clean_groups(host):
+    """The host's groups as a clean list of clean strings, or None if the
+    stored value is structurally wrong / control-char-tainted (so it can never
+    reach nebula_sign's argv and raise a raw ValueError). None -> skip."""
+    groups = host.get("groups", [])
+    if groups is None:
+        return []
+    if not isinstance(groups, list):
+        return None
+    if not all(isinstance(g, str) and _is_clean_str(g) for g in groups):
+        return None
+    return groups
+
+
+def run(job, payload_dir, out_dir, *, ca_dir=config.CA_DIR,
+        registry_path=config.REGISTRY, nebula_ca=nebulacli.ca,
+        nebula_sign=nebulacli.sign, nebula_print=nebulacli.print_json):
+    """Handler entrypoint body. `payload_dir` is accepted, unused,
+    purely for argv-contract uniformity -- rotate-ca reads pubkeys from the
+    registry, never the stick (module docstring). `ca_dir`/`registry_path`/
+    `nebula_ca`/`nebula_sign`/`nebula_print` are DI seams (mirrors
+    ca-bootstrap/sign-hosts' identical convention): production (the `__main__`
+    shim) uses the real config paths + causb.nebulacli functions; tests point
+    all of them at tmpdirs + fake recorders.
+
+    Returns one of the `EXIT_*` codes above; never raises for any foreseeable
+    failure (NebulaError, RegistryError, OSError) -- see module docstring.
+    """
+    del payload_dir  # contract uniformity only; pubkeys come from the registry
+
+    ca_key_path = os.path.join(ca_dir, "ca.key")
+    ca_crt_path = os.path.join(ca_dir, "ca.crt")
+
+    # 1. Not-bootstrapped guard -- FIRST, before args are even looked at
+    # (mirrors sign-hosts). Nothing to rotate on a box with no CA yet.
+    if not (os.path.isfile(ca_key_path) and os.path.isfile(ca_crt_path)):
+        return EXIT_NOT_BOOTSTRAPPED
+
+    # 2. Manifest args -- job.json is the single job dict. args is entirely
+    # unvalidated upstream (causb.manifest.parse never inspects it): a non-dict
+    # args is treated as empty (all defaults apply), mirroring ca-bootstrap.
+    args = job.get("args")
+    if not isinstance(args, dict):
+        args = {}
+
+    # seq is REQUIRED (mirrors sign-hosts): the orchestrator stamps
+    # the manifest's monotonic seq onto the job dict; a missing/non-int/bool/
+    # negative seq is a wiring bug, rejected here rather than defaulted.
+    job_seq = job.get("seq")
+    if job_seq is None or isinstance(job_seq, bool) or not isinstance(job_seq, int) or job_seq < 0:
+        return EXIT_BAD_MANIFEST
+
+    # compromise must be a REAL JSON bool (bool is an int subclass, so a bare
+    # `isinstance(x, bool)` is the correct, and only, accepted shape -- 1/"yes"
+    # are bad_manifest, never silently truthy).
+    compromise = args.get("compromise", False)
+    if not isinstance(compromise, bool):
+        return EXIT_BAD_MANIFEST
+
+    name = args.get("name", _DEFAULT_CA_NAME)
+    duration = args.get("duration", config.CA_DURATION)
+    host_duration = args.get("host_duration", config.HOST_CERT_DURATION)
+    # Control-char guard on `name` (would otherwise reach nebulacli.ca()'s own
+    # _check_clean and raise a bare ValueError, escaping the bounded reason
+    # contract -- exactly ca-bootstrap's lesson); duration policy on both
+    # durations (no unbounded/zero/negative certs).
+    if not _is_clean_str(name):
+        return EXIT_BAD_MANIFEST
+    if not _is_valid_duration(duration) or not _is_valid_duration(host_duration):
+        return EXIT_BAD_MANIFEST
+
+    # 3. Load the registry ONCE. A corrupt/unparseable registry.json folds into
+    # write_failed (no dedicated reason slot) -- and, being read BEFORE any
+    # destructive change, fails closed with the old CA fully intact.
+    try:
+        reg = registry.load(registry_path)
+    except registry.RegistryError:
+        return EXIT_WRITE_FAILED
+
+    # Capture the OLD leaf fingerprints for the compromise blocklist BEFORE any
+    # re-signing -- every host's current fingerprint, INCLUDING hosts that will
+    # be skipped (their old cert is compromised too). De-duplicated + sorted.
+    old_fingerprints = sorted({
+        h["fingerprint"] for h in reg["hosts"].values()
+        if isinstance(h.get("fingerprint"), str) and h["fingerprint"]
+    })
+
+    tmp_new_crt = os.path.join(ca_dir, _TMP_NEW_CRT)
+    tmp_new_key = os.path.join(ca_dir, _TMP_NEW_KEY)
+    scratch_dir = None
+
+    try:
+        # ---- Capture the OLD CA (bytes + fingerprint) before minting the new one.
+        with open(ca_crt_path, "rb") as f:
+            old_ca_crt_bytes = f.read()
+        try:
+            old_ca_fingerprint = nebula_print(ca_crt_path).get("fingerprint")
+        except nebulacli.NebulaError:
+            return EXIT_NEBULA_FAILED
+
+        # ---- Phase A: build EVERYTHING to temp / out_dir. Nothing here touches
+        # the live ca.key/ca.crt/registry.json, so any failure leaves the OLD
+        # CA fully intact and the job re-runnable.
+
+        # Mint the NEW CA to temp paths (version="1" EXPLICIT).
+        try:
+            nebula_ca(name, _CA_CURVE, _CA_VERSION, duration,
+                      out_crt=tmp_new_crt, out_key=tmp_new_key)
+        except nebulacli.NebulaError:
+            _silent_remove(tmp_new_crt)
+            _shred_remove(tmp_new_key)
+            return EXIT_NEBULA_FAILED
+
+        with open(tmp_new_crt, "rb") as f:
+            new_ca_crt_bytes = f.read()
+        try:
+            new_ca_fingerprint = nebula_print(tmp_new_crt).get("fingerprint")
+        except nebulacli.NebulaError:
+            _silent_remove(tmp_new_crt)
+            _shred_remove(tmp_new_key)
+            return EXIT_NEBULA_FAILED
+
+        # Durably land the temp cert/key and pin their final modes NOW, before
+        # the swap -- os.replace preserves the source inode's mode across a
+        # same-fs rename, so the final ca.crt/ca.key never exist at a wrong mode.
+        try:
+            _fsync_file(tmp_new_crt)
+            _fsync_file(tmp_new_key)
+            os.chmod(tmp_new_crt, 0o444)
+            os.chmod(tmp_new_key, 0o400)
+        except OSError:
+            _silent_remove(tmp_new_crt)
+            _shred_remove(tmp_new_key)
+            return EXIT_WRITE_FAILED
+
+        # Re-sign every host that HAS a usable stored pubkey, in a deterministic
+        # sorted-by-name order. The registry is updated ENTIRELY in memory and
+        # only saved (once) after the CA swap commits.
+        updated_reg = reg
+        skipped = []
+        resigned = 0
+        try:
+            scratch_dir = tempfile.mkdtemp(dir=ca_dir, prefix=".rotate-scratch-")
+
+            for index, name_key in enumerate(sorted(reg["hosts"])):
+                host = reg["hosts"][name_key]
+
+                # A host we cannot (or must not) re-sign -> skipped[], untouched.
+                pubkey_bytes = _decode_pubkey(host)
+                groups = _clean_groups(host)
+                ip = host.get("ip")
+                if (pubkey_bytes is None or groups is None
+                        or not _is_safe_basename(name_key)
+                        or not _is_clean_str(ip) or not ip
+                        or name_key.lower() in _RESERVED_CERT_STEMS):
+                    skipped.append(name_key)
+                    continue
+
+                pub_path = os.path.join(scratch_dir, name_key + ".pub")
+                with open(pub_path, "wb") as f:
+                    f.write(pubkey_bytes)
+
+                out_crt = os.path.join(out_dir, name_key + ".crt")
+                networks = f"{ip}/{_FORCED_PREFIXLEN}"
+                nebula_sign(
+                    tmp_new_crt, tmp_new_key, pub_path, name_key, networks,
+                    host_duration, out_crt=out_crt, groups=groups,
+                )
+
+                details = nebula_print(out_crt)
+                fingerprint = details.get("fingerprint")
+                not_after = (details.get("details") or {}).get("notAfter")
+
+                updated_reg = registry.record(
+                    updated_reg, name_key, ip, pubkey_bytes,
+                    fingerprint, not_after, groups,
+                )
+
+                alloc_seq = job_seq * _SEQ_TIEBREAK_MULTIPLIER + index
+                rec = registry.allocation_record(
+                    name_key, ip, hashlib.sha256(pubkey_bytes).hexdigest(),
+                    fingerprint, not_after, groups, seq=alloc_seq,
+                    pubkey=host["pubkey"],
+                )
+                with open(os.path.join(out_dir, f"alloc-{name_key}.json"), "w") as f:
+                    json.dump(rec, f, indent=2, sort_keys=True)
+                resigned += 1
+        except nebulacli.NebulaError:
+            _silent_remove(tmp_new_crt)
+            _shred_remove(tmp_new_key)
+            return EXIT_NEBULA_FAILED
+
+        # The trust bundle (out_dir deliverable): OLD ca.crt bytes ++ NEW ca.crt
+        # bytes -- the transition pki.ca that trusts both during rollout.
+        bundle_bytes = old_ca_crt_bytes + new_ca_crt_bytes
+        with open(os.path.join(out_dir, "ca-bundle.crt"), "wb") as f:
+            f.write(bundle_bytes)
+
+        # Compromise mode only: the nebula pki.blocklist of the OLD leaf
+        # fingerprints (module docstring). Routine rotation writes none.
+        if compromise:
+            blocklist = {"pki": {"blocklist": old_fingerprints}}
+            with open(os.path.join(out_dir, "blocklist.json"), "w") as f:
+                json.dump(blocklist, f, indent=2, sort_keys=True)
+
+        # ---- Phase B: the COMMIT POINT. A tight sequence of same-filesystem
+        # renames; the true point of no return is the ca.key replace.
+
+        # Archive the OLD ca.crt (public) -- non-destructive; a failure here
+        # still leaves the old CA fully intact.
+        archive_dir = os.path.join(ca_dir, "archive")
+        try:
+            os.makedirs(archive_dir, exist_ok=True)
+            os.chmod(archive_dir, 0o700)
+            _atomic_write_bytes(
+                os.path.join(archive_dir, f"ca-{job_seq}.crt"),
+                old_ca_crt_bytes, 0o444,
+            )
+        except OSError:
+            _silent_remove(tmp_new_crt)
+            _shred_remove(tmp_new_key)
+            return EXIT_WRITE_FAILED
+
+        # Open the LIVE old ca.key and hold the fd BEFORE the swap, so its inode
+        # stays reachable (for the in-place shred) after os.replace unlinks it.
+        # ca.key is 0400 (no write bit), so loosen it to 0600 first: O_RDWR
+        # needs write permission and root's permission-bypass must NOT be relied
+        # on (the handler is unit-tested non-root). The key is being destroyed
+        # anyway and never leaves ca_dir (0700, root-only), so the momentary
+        # 0600 is immaterial.
+        try:
+            os.chmod(ca_key_path, 0o600)
+            old_key_fd = os.open(ca_key_path, os.O_RDWR)
+        except OSError:
+            _silent_remove(tmp_new_crt)
+            _shred_remove(tmp_new_key)
+            return EXIT_WRITE_FAILED
+
+        try:
+            old_key_size = os.fstat(old_key_fd).st_size
+            # THE SWAP: crt then key. After the key replace the box always has a
+            # fully-valid NEW CA at ca.crt/ca.key; the old key inode is unlinked
+            # but pinned open by old_key_fd.
+            os.replace(tmp_new_crt, ca_crt_path)
+            os.replace(tmp_new_key, ca_key_path)
+            _fsync_dir(ca_dir)
+
+            # Shred the now-unlinked OLD key inode IN PLACE through the retained
+            # fd (never copied; box already keyed with the new material, so no
+            # keyless window). Best-effort on a CoW/journaling fs (docstring).
+            if old_key_size:
+                os.lseek(old_key_fd, 0, os.SEEK_SET)
+                os.write(old_key_fd, os.urandom(old_key_size))
+                os.fsync(old_key_fd)
+        finally:
+            os.close(old_key_fd)
+
+        # Persist the updated registry (new fingerprints; ip + pubkey carried
+        # through) -- atomic (tmp+fsync+rename+dir-fsync) via registry.save.
+        registry.save(updated_reg, registry_path)
+
+        # On-box copy of the trust bundle (convenience record of the current
+        # transition pki.ca), written last as the least-critical durable file.
+        _atomic_write_bytes(os.path.join(ca_dir, "ca-bundle.crt"), bundle_bytes, 0o444)
+
+        # The receipt (out_dir deliverable), written after the rotation is
+        # durably committed so its presence corresponds to a completed rotate.
+        receipt = {
+            "old_ca_fingerprint": old_ca_fingerprint,
+            "new_ca_fingerprint": new_ca_fingerprint,
+            "hosts_resigned": resigned,
+            "skipped": sorted(skipped),
+            "compromise": compromise,
+        }
+        with open(os.path.join(out_dir, "rotate-receipt.json"), "w") as f:
+            json.dump(receipt, f, indent=2, sort_keys=True)
+
+    except OSError:
+        # Any OSError not already mapped above (an out_dir write, registry.save,
+        # the on-box bundle/receipt). If it fires BEFORE the swap, the old CA is
+        # untouched; the temps are cleaned here. If it somehow fires AFTER the
+        # swap the box is already rotated (new key live, old key shredded); that
+        # residual non-atomicity is
+        # realistically unreachable on the same tmpfs we just wrote through.
+        _silent_remove(tmp_new_crt)
+        _shred_remove(tmp_new_key)
+        return EXIT_WRITE_FAILED
+    finally:
+        if scratch_dir is not None:
+            _cleanup_scratch(scratch_dir)
+
+    return EXIT_OK
+
+
+def _cleanup_scratch(scratch_dir):
+    """Remove the throwaway `.pub` scratch dir (public keys only) -- never
+    raises. Its contents are public, so a plain unlink is sufficient."""
+    try:
+        for entry in os.listdir(scratch_dir):
+            _silent_remove(os.path.join(scratch_dir, entry))
+        os.rmdir(scratch_dir)
+    except OSError:
+        pass
+
+
+def main(argv):
+    if len(argv) != 4:
+        print(f"usage: {argv[0]} <job.json> <payload_dir> <out_dir>", file=sys.stderr)
+        return EXIT_FAULT
+    _, job_path, payload_dir, out_dir = argv
+
+    try:
+        with open(job_path, "rb") as f:
+            job = json.loads(f.read())
+    except (OSError, ValueError):
+        print("rotate-ca: bad_manifest", file=sys.stderr)
+        return EXIT_BAD_MANIFEST
+    if not isinstance(job, dict):
+        print("rotate-ca: bad_manifest", file=sys.stderr)
+        return EXIT_BAD_MANIFEST
+
+    try:
+        rc = run(job, payload_dir, out_dir)
+    except OSError as exc:
+        # Mirrors ca-bootstrap/sign-hosts' identical outer safety net: run() is
+        # designed to catch every foreseeable OSError itself, so this is
+        # belt-and-suspenders, not the primary contract.
+        print(f"rotate-ca: fault: {exc}", file=sys.stderr)
+        return EXIT_WRITE_FAILED
+
+    if rc != EXIT_OK:
+        print(f"rotate-ca: {_REASON_BY_EXIT.get(rc, 'fault')}", file=sys.stderr)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

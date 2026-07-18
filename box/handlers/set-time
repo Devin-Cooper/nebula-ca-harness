@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""box/handlers/set-time -- the "set-time" vetted handler. Repairs the
+box's clock OFFLINE when the
+RTC coin cell dies -- there is no NTP after air-gap, so a drifted/dead
+RTC has no other way back to a sane wall clock. A standalone, extensionless
+script (like box/handlers/backup-ca/ca-bootstrap/sign-hosts before it),
+installed to `config.HANDLERS_DIR` (or run straight out of a repo
+checkout's `box/handlers/`) and invoked by `causb.dispatch` as `set-time
+<job.json> <payload_dir> <out_dir>` -- the same uniform vetted-handler
+argv contract every other handler gets.
+
+**Clock-independent by design -- this is the ONE operation exempt
+from causb.freshness's year>=2026 clock-sanity gate.** `causb.freshness
+.check()` already carries this exemption (`op != "set-time" and not
+clock_sane(...)`), scoped to ONLY the clock check -- box-name/seq/replay
+still fully apply to a set-time job exactly like any other operation (see
+tests/unit/test_freshness.py's carve-out tests). This handler's OWN job
+is the converse half of that safety property: since the box's current
+clock cannot be trusted to gate this operation, THIS handler must be the
+one place that refuses an implausible TARGET, so a malicious or
+fat-fingered manifest cannot rewind the box to an arbitrary date just
+because the clock gate stepped aside for it.
+
+**`args.time` parsing -- stdlib `datetime.fromisoformat`, tz-aware only.**
+Python 3.11+ (the box runs 3.13) accepts a trailing `Z` as well as an
+explicit `+HH:MM` offset; a value that fails to parse at all is
+`bad_manifest`. A value that DOES parse but carries NO timezone
+(`tzinfo is None`, e.g. "2026-06-15T12:00:00" with neither `Z` nor an
+offset) is ALSO `bad_manifest` -- deliberately refused rather than
+guessed, since silently assuming UTC (or the box's own, possibly-wrong-if-
+we're-here-at-all local zone) for an ambiguous timestamp is exactly the
+kind of guess a clock-REPAIR operation must not make. Every accepted
+value is converted to UTC (`astimezone(timezone.utc)`) before the bounds
+check, the `clock_run` call, and the written record -- so a non-UTC-but-
+unambiguous offset (e.g. "+05:00") is honoured correctly rather than
+compared against `config.TIME_MIN`/`TIME_MAX` (themselves UTC) as if it
+were already UTC.
+
+**`config.TIME_MIN`/`TIME_MAX` -- the only sanity bound.** Checked
+AFTER UTC conversion, inclusive on both ends (a target exactly equal to
+either bound is accepted). This is deliberately the sole plausibility gate
+set-time applies to its target -- unlike causb.freshness's box/seq/replay
+checks, which still apply to a set-time job at the ORCHESTRATOR layer
+(box/bin/ca-usb-run), not here.
+
+**`clock_run` -- a single DI seam standing in for the WHOLE "set system
+clock + persist to RTC" operation** (mirrors `ca-bootstrap`/`sign-hosts`'s
+identical `nebula_ca=`/`nebula_sign=` convention: production callers get
+the real two-step `_default_clock_run`; tests inject a fake recorder).
+`_default_clock_run` shells out to `date -u -s <iso>` (sets the running
+system clock) then `hwclock --systohc --utc` (persists it to the RTC) --
+the spec's own "settimeofday/hwclock set" wording, realized as two list-
+argv-only subprocess calls with the same control-char-guard + timeout +
+error-mapping discipline `causb.nebulacli`/`box/handlers/backup-ca`'s
+`_age_encrypt` both use, duplicated locally here (no shared "clockcli"
+module exists, and each is a genuinely different external tool). Needs
+CAP_SYS_TIME, which `box/systemd/ca-usb-job@.service`'s
+`CapabilityBoundingSet=` already grants (verified: `... CAP_SYS_TIME` is
+listed there). Unlike backup-ca's three-way age error split, EVERY clock_run
+failure (either step's nonzero exit, a timeout, or a missing binary)
+collapses into the single `clock_failed` reason -- this handler's own
+narrower vocabulary (`{bad_manifest, implausible_time,
+clock_failed}`) does not distinguish sub-causes here. If the FIRST step
+(`date`) fails, the second (`hwclock`) is never attempted -- persisting a
+clock that was never actually (re)set to the RTC would be worse than doing
+nothing.
+
+**`now` -- a zero-arg DI seam for "the current time before this handler
+changes it"** (production: `datetime.now(timezone.utc)`), read BEFORE
+`clock_run` is invoked, so `time-set.json`'s `"old"` field genuinely
+reflects the pre-repair clock. Tests inject a fixed callable so the
+written record is deterministic.
+
+**Exit codes / reason vocabulary.** `EXIT_OK` (0), `EXIT_FAULT` (1 --
+CLI-invocation misuse, unreachable in production since `causb.dispatch`
+always supplies the fixed 4-element argv), `EXIT_BAD_MANIFEST` (2),
+`EXIT_IMPLAUSIBLE_TIME` (3), `EXIT_CLOCK_FAILED` (4), `EXIT_WRITE_FAILED`
+(5 -- belt-and-suspenders only for the final `time-set.json` write; not
+one of the three reasons the spec itself defines, but consistent with every other handler
+in this codebase carrying one such defensive code for its own output
+write). Only the harness's own "any handler exit != 0 maps to
+handler_failed at the dispatch layer" contract is load-bearing.
+"""
+
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+# APPEND (not insert(0)): see box/handlers/ca-bootstrap's identical comment
+# for the full reasoning -- an explicit PYTHONPATH (e.g. this repo's own
+# unit tests, or the on-box test runner) must be honoured rather than
+# shadowed by a possibly-stale installed copy.
+sys.path.append("/usr/local/lib")
+
+from causb import config  # noqa: E402  (see sys.path.append above)
+
+EXIT_OK = 0
+EXIT_FAULT = 1  # CLI-invocation misuse (wrong argc) -- mirrors ca-bootstrap's
+                # EXIT_FAULT; should never happen in production.
+EXIT_BAD_MANIFEST = 2
+EXIT_IMPLAUSIBLE_TIME = 3
+EXIT_CLOCK_FAILED = 4
+EXIT_WRITE_FAILED = 5
+
+_REASON_BY_EXIT = {
+    EXIT_FAULT: "fault",
+    EXIT_BAD_MANIFEST: "bad_manifest",
+    EXIT_IMPLAUSIBLE_TIME: "implausible_time",
+    EXIT_CLOCK_FAILED: "clock_failed",
+    EXIT_WRITE_FAILED: "write_failed",
+}
+
+_CONTROL_CHARS = frozenset(chr(c) for c in range(0x20)) | {chr(0x7F)}
+
+
+class ClockError(Exception):
+    """Setting/persisting the system clock failed. `reason` is always
+    "clock_failed" -- this handler's spec deliberately does not split
+    clock_run failures into finer sub-reasons (module docstring)."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _is_clean_str(value):
+    """True if `value` is a string containing no control character (NUL,
+    C0 0x00-0x1f, or DEL 0x7f) -- verbatim copy of ca-bootstrap/sign-hosts's
+    own helper (this project's established per-module self-contained-
+    duplication convention)."""
+    if not isinstance(value, str):
+        return False
+    return not any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in value)
+
+
+def _check_clean(argv):
+    """Reject any argv element containing an embedded control character
+    BEFORE exec. Raises a plain ValueError -- verbatim-equivalent of
+    causb.nebulacli._check_clean / box/handlers/backup-ca's identical
+    local copy."""
+    for arg in argv:
+        if any(ch in _CONTROL_CHARS for ch in arg):
+            raise ValueError(f"argument contains a control character: {arg!r}")
+
+
+def _iso(dt):
+    """ISO-UTC timestamp, e.g. 2026-07-13T10:20:30Z -- the same shape
+    box/bin/ca-usb-run's own `_iso()` uses for status.json (duplicated
+    locally per this project's established convention)."""
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _utcnow():
+    """The real current time (production `now=` default). Isolated in its
+    own function purely so a test can inject a fixed value (mirrors
+    box/bin/ca-usb-run's identical `_utcnow` seam)."""
+    return datetime.now(timezone.utc)
+
+
+def _default_clock_run(target_utc, *, runner=subprocess.run, timeout=config.OP_TIMEOUT_S):
+    """Set the running system clock to `target_utc`, then persist it to
+    the RTC (module docstring): `date -u -s <iso>` followed by `hwclock
+    --systohc --utc`, each list-argv-only, control-char-guarded, and
+    timeout-bounded. Raises `ClockError("clock_failed")` on either step's
+    nonzero exit, timeout, or missing binary; the second step is never
+    attempted if the first fails. Returns None on success.
+    """
+    iso_str = _iso(target_utc)
+    steps = (
+        ["date", "-u", "-s", iso_str],
+        ["hwclock", "--systohc", "--utc"],
+    )
+    for argv in steps:
+        _check_clean(argv)
+        try:
+            result = runner(
+                argv,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            raise ClockError("clock_failed")
+        except FileNotFoundError:
+            raise ClockError("clock_failed")
+        if result.returncode != 0:
+            raise ClockError("clock_failed")
+
+
+def _atomic_write_json(dest_dir, name, obj):
+    """tmp -> rename, mirroring box/handlers/status's identical atomic-
+    write idiom (this project's established convention: causb.commitlog,
+    mac/caj, mac/caj-recv, install.sh, status.py all write this way)."""
+    path = os.path.join(dest_dir, name)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def run(job, payload_dir, out_dir, *, clock_run=_default_clock_run, now=_utcnow):
+    """Handler entrypoint body. `payload_dir` is accepted,
+    unused, purely for argv-contract uniformity with every other vetted
+    handler -- set-time needs no job payload file. `clock_run`/`now` are DI
+    seams (module docstring): production calls (the `__main__` shim below)
+    use this module's own `_default_clock_run`/`_utcnow`; tests point both
+    at fakes.
+
+    Returns one of the `EXIT_*` codes above; never raises for any
+    foreseeable failure (`ClockError`, `OSError`) -- see module docstring.
+    """
+    del payload_dir  # contract uniformity only; see docstring
+
+    args = job.get("args")
+    if not isinstance(args, dict):
+        args = {}
+
+    target_raw = args.get("time")
+    if not _is_clean_str(target_raw):
+        return EXIT_BAD_MANIFEST
+    try:
+        target_dt = datetime.fromisoformat(target_raw)
+    except ValueError:
+        return EXIT_BAD_MANIFEST
+    if target_dt.tzinfo is None:
+        # Ambiguous timezone -- refused, not guessed (module docstring).
+        return EXIT_BAD_MANIFEST
+    target_utc = target_dt.astimezone(timezone.utc)
+
+    # config.TIME_MIN/TIME_MAX are themselves ISO strings with an explicit
+    # UTC offset (+00:00) -- parsed the same way as the manifest's own
+    # args.time, never hardcoded as a second literal representation.
+    time_min = datetime.fromisoformat(config.TIME_MIN)
+    time_max = datetime.fromisoformat(config.TIME_MAX)
+    if target_utc < time_min or target_utc > time_max:
+        return EXIT_IMPLAUSIBLE_TIME
+
+    old_dt = now()
+
+    try:
+        clock_run(target_utc)
+    except ClockError:
+        return EXIT_CLOCK_FAILED
+
+    payload = {"old": _iso(old_dt), "new": _iso(target_utc)}
+    try:
+        _atomic_write_json(out_dir, "time-set.json", payload)
+    except OSError:
+        return EXIT_WRITE_FAILED
+
+    return EXIT_OK
+
+
+def main(argv):
+    if len(argv) != 4:
+        print(f"usage: {argv[0]} <job.json> <payload_dir> <out_dir>", file=sys.stderr)
+        return EXIT_FAULT
+    _, job_path, payload_dir, out_dir = argv
+
+    try:
+        with open(job_path, "rb") as f:
+            job = json.loads(f.read())
+    except (OSError, ValueError):
+        print("set-time: bad_manifest", file=sys.stderr)
+        return EXIT_BAD_MANIFEST
+    if not isinstance(job, dict):
+        print("set-time: bad_manifest", file=sys.stderr)
+        return EXIT_BAD_MANIFEST
+
+    try:
+        rc = run(job, payload_dir, out_dir)
+    except OSError as exc:
+        # Mirrors ca-bootstrap's identical outer safety net: run() is
+        # designed to catch every foreseeable OSError itself, so this is
+        # belt-and-suspenders, not the primary contract.
+        print(f"set-time: fault: {exc}", file=sys.stderr)
+        return EXIT_WRITE_FAILED
+
+    if rc != EXIT_OK:
+        print(f"set-time: {_REASON_BY_EXIT.get(rc, 'fault')}", file=sys.stderr)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

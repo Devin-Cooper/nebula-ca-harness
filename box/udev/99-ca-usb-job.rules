@@ -1,0 +1,20 @@
+# udev trigger rule for the air-gapped Nebula CA USB job harness.
+#
+# vfat-scoped ONLY -- deliberately NOT label-scoped (no ENV{ID_FS_LABEL}
+# gate). A blank/unlabeled stick must still reach the harness so it can
+# offer the recovery kit ("insert -> K1 -> kit"); "CA-XFER" is a `caj`
+# packing convention for the Mac tooling, not a udev admission gate. Non-vfat
+# partitions and non-partition block devices (e.g. whole-disk nodes, eMMC)
+# never match and so never trigger a unit start. Concurrent sticks are
+# resolved by the harness's own global flock (causb ca-usb-run), not by this
+# rule -- every matching partition gets its own instance; the flock decides
+# who actually runs.
+#
+# TAG+="systemd" + ENV{SYSTEMD_WANTS}+="ca-usb-job@%k.service" asks
+# systemd-udevd to start (not merely queue) the templated instance for this
+# specific kernel device name (%k, e.g. "sda1") the moment udev processes
+# this "add" event -- this is what fires on both a live hotplug insert AND
+# udev's boot-time coldplug replay (boot-with-stick), since
+# coldplug re-emits synthetic "add" events for everything already present
+# at boot.
+ACTION=="add", SUBSYSTEM=="block", SUBSYSTEMS=="usb", ENV{DEVTYPE}=="partition", ENV{ID_FS_USAGE}=="filesystem", ENV{ID_FS_TYPE}=="vfat", TAG+="systemd", ENV{SYSTEMD_WANTS}+="ca-usb-job@%k.service"

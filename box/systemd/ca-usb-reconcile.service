@@ -1,0 +1,71 @@
+# ca-usb-reconcile.service -- boot-time restart recovery.
+# Runs `ca-usb-run --reconcile` once per boot: rebuild the
+# {STATE_DIR}/seq + consumed-jobs caches from the durable
+# results/<job_id>/DONE markers and purge any pre-DONE partial job dir a
+# power-cut left mid-commit, so seq/idempotency state is consistent after an
+# unclean shutdown (commitlog.reconcile_on_boot). Without this unit nothing
+# ever invokes reconcile_on_boot, so the "cut power mid-commit -> FS
+# recovers, seq consistent" property is unsatisfied.
+#
+# ORDERING RATIONALE (why After=local-fs.target + Before=multi-user.target is
+# sufficient, and why NO flock is needed):
+#   - After=local-fs.target: /var must be mounted before reconcile can read/
+#     write /var/lib/nebula-ca. (Type=oneshot default deps already pull in
+#     sysinit.target, which is itself ordered after local-fs.target; this line
+#     states the dependency explicitly.)
+#   - Before=multi-user.target: reconcile completes before the system reaches
+#     "multi-user" -- the general "system is up" milestone. The udev rule
+#     (99-ca-usb-job.rules) only pulls in a ca-usb-job@%k.service instance in
+#     response to a device `add` uevent, and those device units settle / the
+#     job instances activate well AFTER multi-user.target during a normal boot
+#     (and a boot-with-stick coldplug processes its uevent after this ordering
+#     too). So reconcile is guaranteed to finish before ANY commit() could run
+#     -- which is exactly why this unit takes no flock: the boot ordering, not
+#     a lock, serialises it ahead of every job. reconcile_on_boot is itself
+#     idempotent and safe to run on every boot regardless of shutdown state.
+#
+# EXIT CONTRACT: `ca-usb-run --reconcile` exits 0 on success (including a
+# clean/empty store -- the normal every-boot case) and nonzero only on a
+# genuine reconcile fault, so a failed recovery is visible in the journal
+# (RemainAfterExit=no: this is a transient repair pass, not a state to hold).
+[Unit]
+Description=Nebula CA USB harness boot reconciliation (R7/D22 restart recovery)
+After=local-fs.target
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart=/usr/local/sbin/ca-usb-run --reconcile
+
+# --- Hardening (consistent with ca-usb-job@.service, minus everything that
+# unit only needs for mounting/setpriv/LED/evdev). This unit does PLAIN FILE
+# I/O in the root-owned 0700 /var/lib/nebula-ca tree and nothing else, so it
+# needs write access to exactly that path and NO capabilities at all (root
+# reaches its own 0700/0600 files via owner DAC bits, which need no cap; the
+# empty CapabilityBoundingSet was verified live via systemd-run against this
+# exact property set). Do NOT widen this
+# to the job unit's CAP_SYS_ADMIN/SETUID/SETGID set: reconcile mounts nothing
+# and drops no privilege.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/nebula-ca
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+PrivateMounts=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+# RestrictSUIDSGID omitted: it blocks openat2(2) via seccomp (mode lives in a
+# by-pointer open_how struct seccomp can't inspect), and this unit runs the same
+# ca-usb-run binary whose causb.extract requires openat2. See the full note in
+# ca-usb-job@.service. (This unit only reconciles and does not itself extract,
+# but kept consistent so the shared binary never trips ENOSYS here either.)
+LockPersonality=yes
+NoNewPrivileges=yes
+RestrictNamespaces=yes
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

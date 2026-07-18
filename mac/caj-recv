@@ -1,0 +1,798 @@
+#!/usr/bin/env python3
+"""caj-recv -- online (Mac-side) result verifier + seq reconciler for the
+air-gapped Nebula CA harness.
+
+caj-recv is `mac/caj`'s read-side counterpart: `caj` writes a signed job to
+`<stick>/inbox/`; the (separately implemented, box-side) harness verifies,
+runs, and writes its result to `<stick>/outbox/`; caj-recv reads THAT back,
+independently recomputes the SHA-256 of every declared output file, and only
+on a full match places the outputs into this repo (`hosts/<name>/`,
+`ca-state/ca.crt`, `ca-state/registry.json`) and reconciles this repo's
+`ca-state/last-seq` forward from the box-reported `status.json["seq"]` --
+the reconciliation `caj` itself only ever READS (see `mac/caj`'s own "seq
+bookkeeping" docstring section).
+
+**Platform note -- why caj-recv imports only causb.config.** Exactly like
+`mac/caj` (see ITS module docstring for the full rationale), caj-recv's
+production runtime is the operator's Mac, not the air-gapped Linux box:
+`causb.extract`/`causb.collect`/`causb.commitlog`/`causb.freshness` are all
+box-only in scope (the first drives a raw Linux-only `openat2` syscall via
+ctypes; the others assume `causb.config.STATE_DIR`, a box-local root-owned
+path this Mac binary has no business touching). caj-recv's own integrity
+check (recompute-and-compare SHA-256) is therefore a from-scratch, minimal
+re-implementation using only `hashlib` + `os`, rather than a re-use of
+`causb.collect`.
+
+But it re-implements `causb.collect`'s SYMLINK PARANOIA on purpose, because
+that threat DOES have a direct analogue here. On the box, `collect`
+opens each `out-dir` output `O_NOFOLLOW` + confirms `S_ISREG` so a `run-script`
+can't plant `out-dir/x -> …/ca.key` and have root copy the key out. On the
+Mac, the symmetric risk is a hostile `--stick`: a real FAT32 stick can't hold
+a symlink, but a NON-FAT stick pointed at via `--stick` can (every stick
+is outside the trust boundary), so an `outbox/<job_id>/<path>` that is a
+symlink to an off-stick, Mac-local file would -- if followed -- have its
+TARGET hashed (integrity "passes", target vs. its own declared hash) and the
+target's bytes copied out as a "verified" cert: an arbitrary-file read/exfil.
+So every output file here is opened `os.open(path, O_RDONLY | O_NOFOLLOW)` and
+`fstat`-checked `S_ISREG` (refuse symlink/dir/device/fifo), and the SAME fd is
+used for both the hash and the copy -- never a re-open -- so a file verified
+as a regular file can't be swapped for a symlink (or different content) before
+it is placed. Reads are otherwise of plain files the operator's own Mac has
+full access to.
+
+What caj-recv DOES use `causb.config` for is `config.BOX_NAME`: both
+`outbox/LATEST.json["box"]` and `outbox/<job_id>/status.json["box"]` must
+equal this single-box harness's fixed, immutable box name, or the
+receive is refused outright -- the same "does this claimed box name match
+the one this tooling is pinned to" check the box itself performs on an
+INBOUND manifest, mirrored here on the OUTBOUND report.
+
+**Why there is no signature check on `outbox/`'s contents.** The signed,
+verified wire contract (the trust boundary) governs the INBOUND job
+(`inbox/job.tar`+`.sig`, ssh-sig, namespace `nebula-ca-job`) -- the direction
+that can command the box. The OUTBOUND direction (`outbox/`) is the box
+reporting on its OWN prior action, using bytes it wrote itself; this
+is "public-only data" and the wire contract for `status.json`/
+`LATEST.json` never specifies a return signature. The SHA-256 recompute this
+tool performs is exactly what the spec describes: a check that the bytes on the
+stick right now still match what the box's own status.json said it wrote
+(catching incomplete copies, bit rot, or in-transit tampering of the
+OUTPUT FILES relative to their own declared hash) -- not an authentication
+scheme for status.json itself. That residual (a stick tampered with, between
+box-write and Mac-read, so thoroughly that BOTH an output file and its
+declared hash are replaced self-consistently) is accepted by the design as-is
+(the same "USB stick is outside the trust boundary" posture stated
+plainly for the inbound side), not something the spec asks
+caj-recv to close.
+
+**Processing order (why integrity comes before EVERYTHING else, including
+the status:"ok" branch).** The spec: "[a SHA-256] mismatch -> refuse the WHOLE
+receive." So every declared `outputs[]` entry is verified FIRST, regardless
+of `status.json["status"]` -- nothing is placed, and `ca-state/last-seq` is
+NOT reconciled, if even one entry fails to verify (wrong hash/length, an
+unsafe `path`, or a `path` that doesn't even exist on the stick). Only once
+every declared output has been independently confirmed does caj-recv look at
+`status["status"]`:
+
+  - `status != "ok"` (error|aborted|no_confirmation) -- a legitimate,
+    integrity-verified report of a job that did NOT succeed. No outputs are
+    placed ("do not treat a failed job as delivered output"), and caj-recv
+    exits non-zero -- but `ca-state/last-seq` STILL reconciles forward (see
+    "Why seq reconciles even on failure," below).
+  - `status == "ok"` -- each verified output is mapped to a repo path (see
+    "Output placement rules," below) and copied in; `ca-state/last-seq`
+    reconciles forward LAST, only once every recognized output has been
+    durably placed (so a placement failure partway through -- e.g. a full
+    disk -- leaves last-seq NOT YET advanced, and a re-run of caj-recv
+    retries the full receive rather than silently treating a partial
+    placement as done).
+
+**Why seq reconciles even on a failed job.** The box's own freshness gate
+("seq > last") runs BEFORE the K1 confirmation gate and BEFORE
+dispatch/commit -- so ANY status.json the box ever produces for a
+job_id (ok, error, aborted, or no_confirmation) reflects a seq value the box
+had already accepted as its new high-water mark before attempting anything.
+Refusing to track that forward on the Mac side would let a later `caj build`
+(whose own `seq = max(repo ca-state/last-seq, last-built-seq)+1` formula --
+see `mac/caj`'s docstring) undershoot and mint an already-consumed seq the
+box would then reject as `stale_seq`. Reconciliation is also always SAFE
+regardless of status, because it is a plain `max(current, reported)`: it can
+only move `ca-state/last-seq` forward or leave it unchanged, never regress
+it, no matter what value a given status.json reports (this is also what
+makes a same-seq *replay* a harmless no-op on the seq file while still
+re-placing/re-confirming the replayed bytes).
+
+**Output placement rules (three named shapes; a `path` not matching any
+of them is left un-placed -- on the stick only -- with an informational
+note, not an error: a future operation's output kind this version of
+caj-recv doesn't yet know how to place should not sink an otherwise-valid
+receive):**
+
+  "ca.crt"        -> ca-state/ca.crt        (the CA cert itself)
+  "registry.json" -> ca-state/registry.json (repo registry mirror)
+  "<name>.crt"    -> hosts/<name>/<name>.crt (a signed host cert; <name> is
+                     the filename stem, e.g. "alice.crt" -> host "alice")
+
+"ca.crt" and "registry.json" are matched as EXACT names first, ahead of the
+generic "*.crt" rule, so the literal CA cert is never mistaken for a host
+confusingly named "ca".
+
+**Path-safety validation happens BEFORE a declared output is even opened for
+its integrity check** -- not just before the later repo-placement write.
+Every `outputs[].path` must be a safe single path component (no "/", not
+"." or "..", not absolute) before it is joined into EITHER
+`<job_dir>/<path>` (to read+hash it) or a repo destination ("Validate
+each outputs[].path is a safe basename ... before using it to build a repo
+path"). A `path` of e.g. "../../hosts/evil/evil.crt" is rejected outright,
+never opened, exactly like a bad `payload[]` entry is rejected by
+`causb.manifest.parse()` on the inbound side (same "/", ".", ".." shape of
+check, mirrored here at the single-component granularity this schema uses).
+
+**Repo layout + test isolation.** `ca-state/` and `hosts/` are resolved
+relative to this repo checkout (`dirname(dirname(__file__))`), overridable
+via the `CAJ_STATE_DIR`/`CAJ_HOSTS_DIR` environment variables -- the former
+is the EXACT SAME variable `mac/caj` already uses for `ca-state/`'s location
+(so both tools agree on where `ca-state/last-seq` -- and the single shared
+lock file, below -- live with zero extra configuration); `CAJ_HOSTS_DIR`
+mirrors that same convention for `hosts/`. Neither is a new CLI flag (the
+spec's documented `caj-recv --stick <mnt>` interface is exactly what ships)
+-- both exist solely so this project's own test suite can point both
+directories at a tempdir without ever touching the real checkout.
+
+**Single-writer, shared with `mac/caj`'s own lock.** The whole receive (from
+reading LATEST.json through the final seq write) runs under an exclusive
+`fcntl.flock()` on `<ca-state>/.caj.lock` -- the IDENTICAL lock file `caj
+build` takes around its own seq-reservation. This is not just a second,
+independent lock that happens to share a name: `caj build`'s seq formula
+reads `ca-state/last-seq`, the exact file caj-recv's reconciliation writes,
+so the two tools contending for the SAME lock is what actually prevents a
+`caj-recv` reconciliation racing a concurrent `caj build`'s read of that
+file (which could otherwise let the build undershoot the seq it reserves).
+"""
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+
+# causb (box/lib/causb) is this repo's own package -- caj-recv runs standalone
+# on the operator's Mac with no PYTHONPATH set up, so it must find it itself,
+# relative to its own location, exactly like mac/caj does.
+sys.path.insert(0, os.path.join(REPO_ROOT, "box", "lib"))
+
+from causb import config  # noqa: E402  (see sys.path.insert above)
+
+_OUTBOX_DIRNAME = "outbox"
+_LATEST_NAME = "LATEST.json"
+_STATUS_NAME = "status.json"
+_ERROR_NAME = "ERROR.json"  # on-stick pre-commit failure breadcrumb
+# ERROR.json field bounds (UNTRUSTED stick content): the box only ever writes a
+# coarse enum `reason` and a strict ISO-UTC `ts`, so validate both to that shape
+# on read -- a hostile/corrupt stick must not smuggle control bytes (terminal
+# spoofing) or an unbounded string through fields the operator sees printed.
+_MAX_REASON_LEN = 64
+_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_LAST_SEQ_NAME = "last-seq"
+_LOCK_NAME = ".caj.lock"
+_CA_CRT_NAME = "ca.crt"
+_REGISTRY_NAME = "registry.json"
+_CRT_SUFFIX = ".crt"
+
+# LATEST.json/status.json are small structured records, not user data, so
+# this cap is generous -- it exists only so a corrupt/hostile stick can't
+# make caj-recv read an unbounded file into memory. The spec doesn't state an
+# explicit cap for the OUTBOUND side (only the inbound manifest has one),
+# but the "every USB stick is outside the trust boundary" posture applies
+# just as well to reading these files, so this tool applies one anyway.
+_MAX_JSON_BYTES = 1024 * 1024
+
+# Every declared output's file descriptor is held OPEN from the moment it is
+# verified until it is either placed or the receive ends (so a regular file
+# hashed at verify time is the EXACT same bytes copied at place time -- one
+# fd, never re-opened; see `_verify_outputs`). That means the number of
+# concurrently-open fds scales with `len(outputs)`, so a hostile status.json
+# declaring thousands of outputs (which `_MAX_JSON_BYTES` alone would still
+# permit) could exhaust the process fd table (macOS defaults to a 256 soft
+# limit). This cap fails such a status.json closed with a clear message
+# rather than a murky EMFILE partway through. A real job's outputs are a
+# handful (at most `causb.config.CAPS["payload_files"]` == 16 host certs plus
+# ca.crt/registry.json/box-info.json); 64 is comfortably above any legitimate
+# value yet far under the fd budget.
+_MAX_OUTPUTS = 64
+
+
+class CajRecvError(Exception):
+    """A user-facing caj-recv CLI error: a missing/malformed status.json, an
+    integrity (SHA-256) mismatch, an unsafe outputs[].path, or a bad --stick.
+    Caught once at main() and reported to stderr with exit code 1 -- never a
+    raw traceback for one of these expected, nameable failure modes."""
+
+
+def _is_strict_int(value) -> bool:
+    """True for a genuine int, rejecting bool (a bool is an int subclass in
+    Python, so a naive `value != 1` would let `True` slip past a `== 1`
+    check) -- mirrors causb.manifest.parse()'s own `_is_strict_int` exactly,
+    kept as a local duplicate per this project's established convention of
+    small, self-contained per-module helpers (see causb.commitlog's
+    docstring) rather than a cross-module import for one four-line
+    function."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_safe_basename(name) -> bool:
+    """True iff `name` is safe to join as a SINGLE path component when
+    building a filesystem path from untrusted, stick-supplied content --
+    both for the READ side (recomputing an output's sha256 from
+    `<job_dir>/<name>`) and the later repo-placement WRITE side (`hosts/
+    <name>/`, `ca-state/<name>`). Mirrors causb.manifest.parse()/
+    causb.extract._safe_name's own "/", ".", ".." checks,
+    specialized to a single component (this schema's paths are always one
+    flat filename, never a nested relative path).
+
+    Also rejects any control character (C0 range, DEL, and in particular the
+    NUL byte -- a JSON manifest can encode `\u0000` in a string). A NUL slips
+    past a naive "/", ".", ".." check but makes `os.open()`/`os.stat()` raise
+    `ValueError("embedded null byte")` -- so rejecting it HERE (before the
+    name is ever joined into a path and opened) is what keeps that from
+    surfacing as a raw, uncaught traceback rather than a clean CajRecvError."""
+    if not isinstance(name, str) or name == "":
+        return False
+    if os.path.isabs(name):
+        return False
+    if "/" in name or "\\" in name:
+        return False
+    if name in (".", ".."):
+        return False
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in name):
+        return False
+    return True
+
+
+def _read_json(path: str):
+    """Read + parse `path` as JSON, raising CajRecvError (never a raw
+    OSError/JSONDecodeError) on any I/O failure, oversize file, or invalid
+    JSON -- including a RecursionError from a deeply-nested JSON bomb, which
+    is a RuntimeError (not caught by a plain `except ValueError`) and would
+    otherwise crash this tool outright; causb.manifest.parse() documents the
+    identical hazard for the inbound manifest.json."""
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        raise CajRecvError(f"cannot stat {path}: {exc}")
+    if size > _MAX_JSON_BYTES:
+        raise CajRecvError(f"{path} is too large ({size} bytes; cap {_MAX_JSON_BYTES})")
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as exc:
+        raise CajRecvError(f"cannot read {path}: {exc}")
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, RecursionError):
+        raise CajRecvError(f"{path} is not valid JSON")
+
+
+# --- status.json schema validation ---
+
+
+def _validate_status(status, expected_job_id: str) -> list:
+    """Validate `status` (already-parsed JSON) against the schema fields
+    caj-recv's own logic depends on, failing closed (CajRecvError) on any
+    missing/wrong-typed field rather than silently defaulting -- this is
+    untrusted, stick-supplied content, validated with the same strictness
+    causb.manifest.parse() applies to the inbound manifest.json. Returns the
+    validated `outputs[]` list on success (each entry itself checked for a
+    well-typed path/sha256/bytes).
+
+    `expected_job_id` is outbox/LATEST.json's own job_id (already checked by
+    the caller to be a safe basename) -- status.json's OWN `job_id` field
+    must agree with it, or this is treated as a corrupt/mismatched commit
+    marker rather than silently trusting one field over the other.
+    """
+    if not isinstance(status, dict):
+        raise CajRecvError("status.json is not a JSON object")
+
+    schema_version = status.get("schema_version")
+    if not _is_strict_int(schema_version) or schema_version != 1:
+        raise CajRecvError(f"status.json has unknown schema_version: {schema_version!r}")
+
+    if not isinstance(status.get("status"), str):
+        raise CajRecvError("status.json missing/invalid 'status' field")
+
+    if status.get("box") != config.BOX_NAME:
+        raise CajRecvError(
+            f"status.json box {status.get('box')!r} does not match "
+            f"this harness's box ({config.BOX_NAME!r})"
+        )
+
+    if status.get("job_id") != expected_job_id:
+        raise CajRecvError(
+            f"status.json job_id {status.get('job_id')!r} disagrees with "
+            f"outbox/LATEST.json job_id {expected_job_id!r}"
+        )
+
+    seq = status.get("seq")
+    if not _is_strict_int(seq) or seq < 0:
+        raise CajRecvError("status.json missing/invalid non-negative integer 'seq' field")
+
+    outputs = status.get("outputs")
+    if not isinstance(outputs, list):
+        raise CajRecvError("status.json missing/invalid 'outputs' list")
+
+    for entry in outputs:
+        if not isinstance(entry, dict):
+            raise CajRecvError(f"status.json outputs[] entry is not an object: {entry!r}")
+        if not isinstance(entry.get("path"), str):
+            raise CajRecvError(f"status.json outputs[] entry missing 'path': {entry!r}")
+        if not isinstance(entry.get("sha256"), str):
+            raise CajRecvError(f"status.json outputs[] entry missing 'sha256': {entry!r}")
+        if not _is_strict_int(entry.get("bytes")) or entry["bytes"] < 0:
+            raise CajRecvError(f"status.json outputs[] entry missing/invalid 'bytes': {entry!r}")
+
+    return outputs
+
+
+def _validate_error_breadcrumb(bc) -> dict:
+    """Validate a stick-supplied outbox/ERROR.json (the box's pre-commit failure
+    breadcrumb) against its schema, failing closed (CajRecvError)
+    on any missing/wrong-typed field -- untrusted, stick-supplied content, held
+    to the same strictness as _validate_status. `job_id`/`seq`/`bundle_id` are
+    best-effort (present-or-null): validated only if non-null."""
+    if not isinstance(bc, dict):
+        raise CajRecvError("ERROR.json is not a JSON object")
+
+    schema_version = bc.get("schema_version")
+    if not _is_strict_int(schema_version) or schema_version != config.SCHEMA_VERSIONS["error"]:
+        raise CajRecvError(f"ERROR.json has unknown schema_version: {schema_version!r}")
+
+    if bc.get("box") != config.BOX_NAME:
+        raise CajRecvError(
+            f"ERROR.json box {bc.get('box')!r} does not match "
+            f"this harness's box ({config.BOX_NAME!r})"
+        )
+
+    reason = bc.get("reason")
+    if not isinstance(reason, str) or not 0 < len(reason) <= _MAX_REASON_LEN:
+        raise CajRecvError(
+            f"ERROR.json missing/invalid 'reason' (str, 1..{_MAX_REASON_LEN} chars)"
+        )
+    if bc.get("phase") not in config.ERROR_PHASES:
+        raise CajRecvError(f"ERROR.json has unknown 'phase': {bc.get('phase')!r}")
+    ts = bc.get("ts")
+    if not isinstance(ts, str) or not _TS_RE.match(ts):
+        raise CajRecvError(
+            f"ERROR.json has invalid 'ts' (want strict ISO-UTC YYYY-MM-DDThh:mm:ssZ): {ts!r}"
+        )
+
+    job_id = bc.get("job_id")
+    if job_id is not None and not isinstance(job_id, str):
+        raise CajRecvError(f"ERROR.json 'job_id' must be a string or null: {job_id!r}")
+    seq = bc.get("seq")
+    if seq is not None and (not _is_strict_int(seq) or seq < 0):
+        raise CajRecvError(f"ERROR.json 'seq' must be a non-negative int or null: {seq!r}")
+    bundle_id = bc.get("bundle_id")
+    if bundle_id is not None and not isinstance(bundle_id, str):
+        raise CajRecvError(f"ERROR.json 'bundle_id' must be a string or null: {bundle_id!r}")
+
+    return bc
+
+
+def _report_error_breadcrumb(error_path: str) -> None:
+    """Read + validate outbox/ERROR.json and print a clear operator report of a
+    job that failed AFTER signature verification but BEFORE it ran.
+    Places NO outputs and reconciles NO seq -- the box consumed none, so the
+    same job can be fixed and re-inserted at the SAME seq. The caller returns
+    nonzero. A reason of `verify_failed` WITH a breadcrumb present means the job
+    was authenticated but refused (e.g. break-glass scope), NOT a forged
+    signature (a forged/unsigned stick leaves no breadcrumb) -- worded so."""
+    bc = _validate_error_breadcrumb(_read_json(error_path))
+    reason = bc["reason"]
+    job_id = bc.get("job_id")
+    seq = bc.get("seq")
+    job_id_str = repr(job_id) if job_id else "unknown"
+    seq_str = str(seq) if seq is not None else "unknown"
+    verb = "was refused" if reason == "verify_failed" else "failed"
+    print(
+        f"caj-recv: the last insertion {verb} before the job ran "
+        f"(reason={reason!r}, phase={bc['phase']!r}, job_id={job_id_str}, "
+        f"seq={seq_str}, at {bc['ts']}). No seq was consumed -- fix the job "
+        f"and re-insert.",
+        file=sys.stderr,
+    )
+
+
+# --- integrity verification (recompute sha256, compare to declared) ---
+
+
+def _open_regular_readonly(path: str) -> int:
+    """Open `path` `O_RDONLY | O_NOFOLLOW` and confirm via `fstat` that it is
+    a REGULAR file, returning the fd. Raises CajRecvError (fd closed) on a
+    symlink (`O_NOFOLLOW` -> `ELOOP`), any non-regular type (dir/device/fifo/
+    socket), a missing file, or any other open/stat failure.
+
+    This is the Mac-side analog of the box's `causb.collect` symlink
+    paranoia, and it is the CRITICAL fix: a real FAT32 stick can't hold a
+    symlink, but a hostile NON-FAT stick pointed at via `--stick` can (the
+    stick is outside the trust boundary). Without `O_NOFOLLOW`, an
+    `outbox/<job_id>/<path>` that is a symlink to an off-stick, Mac-local file
+    would have its TARGET's bytes hashed here (integrity "passes" -- the target
+    is compared against its own declared hash) and, worse, copied out as a
+    "verified" cert by the placement step -- an arbitrary-file-read/exfil. With
+    `O_NOFOLLOW` + `S_ISREG`, the symlink is refused before a single byte is
+    read.
+
+    The refusal message is deliberately GENERIC ("output integrity/type check
+    failed") and never echoes a hash/size: since the file is never followed
+    and never read on this path, there is nothing of the would-be target to
+    leak -- and keeping the message content-free is belt-and-braces against
+    ever doing so."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        # ELOOP (symlink), ENOENT (missing/dangling), EACCES, ... every one of
+        # these means "this declared output cannot be trusted" -> refuse whole.
+        raise CajRecvError("output integrity/type check failed")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise CajRecvError("output integrity/type check failed")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _hash_fd(fd: int):
+    """(hex sha256, byte length) of the ALREADY-OPEN `fd`'s full contents,
+    read in fixed-size chunks from offset 0 (bounded memory regardless of
+    file size). Reads from the SAME fd the caller will later copy from, so a
+    regular file verified here cannot be swapped (for a symlink, or for
+    different content) before it is placed."""
+    hasher = hashlib.sha256()
+    size = 0
+    os.lseek(fd, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(fd, 1024 * 1024)
+        if not chunk:
+            break
+        hasher.update(chunk)
+        size += len(chunk)
+    return hasher.hexdigest(), size
+
+
+def _verify_outputs(job_dir: str, outputs: list) -> list:
+    """Recompute the SHA-256 (and byte length) of every declared outputs[]
+    entry directly from `<job_dir>/<path>` and compare against status.json's
+    own declared values. ANY mismatch -- content tampering/corruption, a
+    truncated copy, a `path` that doesn't even exist, or a `path` that is a
+    SYMLINK/dir/device rather than a regular file -- refuses the WHOLE receive
+    (raises CajRecvError): nothing gets placed and `ca-state/last-seq` is not
+    reconciled, no matter how many OTHER entries verified cleanly (the spec:
+    "Any mismatch -> refuse the whole receive").
+
+    Every `path` is validated as a safe single-component basename BEFORE it is
+    joined into ANY filesystem path -- for this read just as much as for the
+    later repo-placement write -- so a `path` like "../../etc/passwd" or
+    "/etc/passwd" (or one containing a NUL) is rejected outright, never opened.
+
+    On success returns a list of `(path, open_fd)` for every verified entry,
+    in `outputs[]`'s original order, with each fd STILL OPEN (positioned at
+    EOF): the caller both owns those fds (it MUST close every one) and, if
+    status=="ok", copies each output from its own already-verified fd -- never
+    re-opening the path, so the exact bytes hashed here are the bytes placed.
+    On ANY failure this function closes every fd it had opened before
+    re-raising, so a partial verification never leaks descriptors."""
+    if len(outputs) > _MAX_OUTPUTS:
+        raise CajRecvError(
+            f"status.json declares too many outputs ({len(outputs)}; cap {_MAX_OUTPUTS})"
+        )
+    verified = []  # list of (path, fd), fds held open for the caller
+    try:
+        for entry in outputs:
+            path = entry["path"]
+            if not _is_safe_basename(path):
+                raise CajRecvError(f"outputs[].path is not a safe basename: {path!r}")
+
+            src = os.path.join(job_dir, path)
+            fd = _open_regular_readonly(src)  # O_NOFOLLOW + S_ISREG (Critical fix)
+            verified.append((path, fd))
+
+            actual_sha256, actual_bytes = _hash_fd(fd)
+            if actual_sha256 != entry["sha256"] or actual_bytes != entry["bytes"]:
+                # Generic message: don't echo declared/actual hashes.
+                raise CajRecvError(f"output integrity/type check failed: {path!r}")
+    except BaseException:
+        for _path, fd in verified:
+            os.close(fd)
+        raise
+    return verified
+
+
+# --- output placement (three named shapes) ---
+
+
+def _resolve_dest(path: str, hosts_dir: str, state_dir: str):
+    """Map one verified outputs[] `path` (already confirmed to be a safe
+    basename by `_verify_outputs`) to its repo placement target, or `None`
+    if `path` doesn't match any of the three named shapes (left on the
+    stick, not an error -- see module docstring)."""
+    if path == _CA_CRT_NAME:
+        return os.path.join(state_dir, _CA_CRT_NAME)
+    if path == _REGISTRY_NAME:
+        return os.path.join(state_dir, _REGISTRY_NAME)
+    if path.endswith(_CRT_SUFFIX):
+        name = path[: -len(_CRT_SUFFIX)]
+        if not _is_safe_basename(name):
+            # e.g. path == ".crt" (empty stem) or "..crt" (stem "..") -- not
+            # a usable host name; leave unplaced rather than risk an unsafe
+            # hosts/<name>/ join.
+            return None
+        return os.path.join(hosts_dir, name, f"{name}{_CRT_SUFFIX}")
+    return None
+
+
+def _place_from_fd(src_fd: int, final_path: str) -> None:
+    """Copy the ALREADY-VERIFIED, still-open `src_fd`'s bytes (from offset 0)
+    to a `.tmp` sibling of `final_path` (creating its parent directory, e.g.
+    `hosts/<name>/`, if needed), flush + fsync it, then `os.replace()` it into
+    `final_path` -- the same tmp -> fsync -> rename convention `mac/caj`'s own
+    `_place_atomic` and `causb.commitlog`'s `_atomic_write` use, so a crash
+    mid-placement can never leave a truncated cert/registry file at the final
+    repo path, only a stray untouched `.tmp`.
+
+    Copies from `src_fd` (NOT a fresh `open(path)`), so the bytes placed here
+    are byte-for-byte the ones `_verify_outputs` already hashed -- no re-open,
+    no window for a symlink/content swap between verify and place.
+
+    Any filesystem error (a pre-existing non-directory blocking `hosts/<name>/`,
+    a read-only repo, a full disk, ...) is raised as a CajRecvError, never a
+    raw OSError traceback."""
+    tmp_path = final_path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(final_path), exist_ok=True)
+        os.lseek(src_fd, 0, os.SEEK_SET)
+        with open(tmp_path, "wb") as dst:
+            while True:
+                chunk = os.read(src_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+            dst.flush()
+            os.fsync(dst.fileno())
+        os.replace(tmp_path, final_path)
+    except OSError as exc:
+        raise CajRecvError(f"cannot place output at {final_path!r}: {exc}")
+
+
+# --- repo layout (ca-state/last-seq, hosts/) ---
+
+
+def _fsync_dir(path: str) -> None:
+    """Open `path` as a directory and `os.fsync` it, so a pending child rename
+    against THAT directory's inode is made durable -- the companion call an
+    atomic tmp -> rename needs before the new name survives power loss (see
+    causb.commitlog's `_fsync_dir`, whose contract this mirrors). Best-effort:
+    a platform that refuses to fsync a directory fd must not turn a successful
+    receive into a failure, so an OSError here is swallowed."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _state_dir() -> str:
+    """`ca-state/`'s location -- the SAME env var (`CAJ_STATE_DIR`) and
+    default (`<repo_root>/ca-state`) `mac/caj` uses for the identical
+    directory (see module docstring)."""
+    override = os.environ.get("CAJ_STATE_DIR")
+    if override:
+        return override
+    return os.path.join(REPO_ROOT, "ca-state")
+
+
+def _hosts_dir() -> str:
+    """`hosts/<name>/`'s parent location -- `CAJ_HOSTS_DIR` env override
+    (mirroring `CAJ_STATE_DIR`'s convention), defaulting to
+    `<repo_root>/hosts`."""
+    override = os.environ.get("CAJ_HOSTS_DIR")
+    if override:
+        return override
+    return os.path.join(REPO_ROOT, "hosts")
+
+
+def _read_last_seq(state_dir: str) -> int:
+    try:
+        with open(os.path.join(state_dir, _LAST_SEQ_NAME)) as f:
+            return int(f.read().strip())
+    except FileNotFoundError:
+        return 0
+
+
+def _write_last_seq_atomic(state_dir: str, value: int) -> None:
+    """Write `ca-state/last-seq` = `value` durably: tmp -> flush -> fsync ->
+    rename -> fsync the containing dir. Unlike `mac/caj`'s non-safety-critical
+    `last-built-seq` (whose bytes nothing downstream trusts), THIS file IS
+    trusted -- `caj._next_seq()` reads it as the `max(...)` baseline for the
+    seq it reserves -- so a power loss that left it torn or reverted could let
+    a later `caj build` mint an already-consumed seq the box then rejects as
+    stale_seq. The fsync-before-rename + dir-fsync (matching
+    `causb.commitlog._atomic_write` + `_fsync_dir`) is what closes that."""
+    os.makedirs(state_dir, exist_ok=True)
+    final_path = os.path.join(state_dir, _LAST_SEQ_NAME)
+    tmp_path = final_path + ".tmp"
+    with open(tmp_path, "w") as f:
+        f.write(str(value))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, final_path)
+    _fsync_dir(state_dir)
+
+
+def _with_lock(state_dir: str, fn):
+    """Single-writer, sharing `mac/caj`'s OWN identically-named+located lock
+    (`<state_dir>/.caj.lock`) -- see module docstring for why reusing caj's
+    lock (not a second, independent one) is what actually prevents a
+    caj-recv reconciliation from racing a concurrent `caj build`."""
+    os.makedirs(state_dir, exist_ok=True)
+    lock_path = os.path.join(state_dir, _LOCK_NAME)
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        return fn()
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+# --- the main receive flow ---
+
+
+def recv_command(args: argparse.Namespace) -> int:
+    stick = os.path.abspath(os.path.expanduser(args.stick))
+    if not os.path.isdir(stick):
+        raise CajRecvError(f"--stick path does not exist or is not a directory: {stick}")
+
+    latest_path = os.path.join(stick, _OUTBOX_DIRNAME, _LATEST_NAME)
+    error_path = os.path.join(stick, _OUTBOX_DIRNAME, _ERROR_NAME)
+    latest_present = os.path.isfile(latest_path)
+    error_present = os.path.isfile(error_path)
+    if not latest_present and not error_present:
+        # Gate on LATEST.json ("the reader's commit gate") OR the
+        # pre-commit ERROR.json breadcrumb: both absent means the
+        # box has nothing to report yet. Clean exit, no side effects --
+        # ca-state/ isn't even created for this check.
+        print("caj-recv: no outbox/LATEST.json or ERROR.json on the stick -- "
+              "nothing to receive.")
+        return 0
+
+    state_dir = _state_dir()
+    hosts_dir = _hosts_dir()
+
+    def _do_receive() -> int:
+        # Pre-commit failure breadcrumb: an authenticated job that
+        # aborted BEFORE commit leaves ERROR.json but no LATEST.json and
+        # consumes no seq. Report it (reconciling nothing); when it coexists
+        # with a still-unreceived delivered LATEST.json, report both and exit
+        # nonzero regardless.
+        error_rc = 0
+        if error_present:
+            try:
+                _report_error_breadcrumb(error_path)
+                error_rc = 1
+            except CajRecvError:
+                # A malformed/hostile breadcrumb must not sink an otherwise-valid,
+                # already-committed delivery that coexists with it. With nothing
+                # else to receive, surface it (fail-closed like every other
+                # reader); alongside a LATEST.json, warn and still deliver.
+                if not latest_present:
+                    raise
+                print("caj-recv: warning: outbox/ERROR.json is present but "
+                      "unreadable/invalid; proceeding with the delivered result.",
+                      file=sys.stderr)
+                error_rc = 1
+        if not latest_present:
+            return error_rc
+
+        latest = _read_json(latest_path)
+        if not isinstance(latest, dict):
+            raise CajRecvError("outbox/LATEST.json is not a JSON object")
+        job_id = latest.get("job_id")
+        if not _is_safe_basename(job_id):
+            raise CajRecvError(
+                f"outbox/LATEST.json job_id is not a safe basename: {job_id!r}"
+            )
+        if latest.get("box") != config.BOX_NAME:
+            raise CajRecvError(
+                f"outbox/LATEST.json box {latest.get('box')!r} does not match "
+                f"this harness's box ({config.BOX_NAME!r})"
+            )
+
+        job_dir = os.path.join(stick, _OUTBOX_DIRNAME, job_id)
+        status_path = os.path.join(job_dir, _STATUS_NAME)
+        if not os.path.isfile(status_path):
+            raise CajRecvError(f"outbox/{job_id}/status.json is missing")
+        status = _read_json(status_path)
+        outputs = _validate_status(status, expected_job_id=job_id)
+
+        # Integrity FIRST, unconditionally -- refuses the whole receive
+        # before anything is placed or reconciled (see module docstring). Each
+        # returned fd is held OPEN (O_NOFOLLOW-verified as a regular file) so
+        # placement copies the exact verified bytes; we own them and MUST
+        # close every one, in a finally, on every exit path.
+        verified = _verify_outputs(job_dir, outputs)
+        try:
+            seq = status["seq"]
+
+            if status["status"] != "ok":
+                # A legitimate, integrity-verified report of a job that did NOT
+                # succeed -- reconcile seq (see module docstring) but place
+                # nothing that could be mistaken for delivered output.
+                new_seq = max(_read_last_seq(state_dir), seq)
+                _write_last_seq_atomic(state_dir, new_seq)
+                print(
+                    f"caj-recv: job {job_id} did not complete successfully "
+                    f"(status={status['status']!r}, error={status.get('error')!r}); "
+                    f"no outputs placed. ca-state/last-seq reconciled to {new_seq}.",
+                    file=sys.stderr,
+                )
+                return 1
+
+            placed = []
+            skipped = []
+            for path, src_fd in verified:
+                dest = _resolve_dest(path, hosts_dir, state_dir)
+                if dest is None:
+                    skipped.append(path)
+                    continue
+                _place_from_fd(src_fd, dest)
+                placed.append(dest)
+
+            # Reconcile LAST, only once every recognized output is durably
+            # placed: a failure partway through placement leaves last-seq NOT
+            # yet advanced, so a re-run retries the full receive.
+            new_seq = max(_read_last_seq(state_dir), seq)
+            _write_last_seq_atomic(state_dir, new_seq)
+
+            note = f", skipped {len(skipped)} unrecognized" if skipped else ""
+            print(
+                f"caj-recv: received job {job_id} (seq={seq}); "
+                f"placed {len(placed)} file(s){note}; "
+                f"ca-state/last-seq reconciled to {new_seq}."
+            )
+            return error_rc  # 0, unless a pre-commit ERROR.json also coexisted
+        finally:
+            for _path, src_fd in verified:
+                os.close(src_fd)
+
+    return _with_lock(state_dir, _do_receive)
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="caj-recv")
+    parser.add_argument(
+        "--stick", required=True, help="Path to the mounted USB stick."
+    )
+    parsed = parser.parse_args(argv)
+
+    try:
+        return recv_command(parsed)
+    except CajRecvError as exc:
+        print(f"caj-recv: error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,623 @@
+#!/usr/bin/env python3
+"""box/handlers/rotate-job-signers -- the co-sign-aware trust-anchor rotation
+handler. This is the
+MOST security-sensitive vetted handler: it edits the two files that decide
+WHO may command the CA. A bug here can lock the operator out permanently, or
+silently weaken the break-glass protection, so every step is fail-closed and
+ALL validation completes before EITHER anchor file is touched.
+
+A standalone, extensionless script (like box/handlers/ca-bootstrap/set-time/
+sign-hosts before it), installed to `config.HANDLERS_DIR` (or run straight
+out of a repo checkout's `box/handlers/`) and invoked by `causb.dispatch` as
+`rotate-job-signers <job.json> <payload_dir> <out_dir>` -- the same uniform
+vetted-handler argv contract every other handler gets.
+
+**Wire format: full-file replacement (auditable, no ambiguous merge).** The
+operator submits the COMPLETE proposed new anchor file(s) as payload files
+(already operator-signed + hardened-tar-extracted by the harness, so this
+handler only ever READS root-owned, immutable tmpfs files):
+  - `payload/allowed_signers` (REQUIRED) -- the complete proposed new
+    operational signer set. Absent -> `bad_manifest`.
+  - `payload/breakglass_signers` (OPTIONAL) -- the complete proposed new
+    break-glass set. Absent -> break-glass is left entirely unchanged.
+The installed anchor bytes are the operator's submitted bytes VERBATIM
+(comments, principal names, ordering preserved) -- an auditable 1:1 of what
+was signed, never a re-serialization.
+
+**The co-sign gate, strict `cosigned is True`.** Changing ONLY
+`allowed_signers` is authorized by the operator's PRIMARY signature alone
+(`cosigned` need not be True). But ANY change to the `breakglass_signers`
+key-SET requires a break-glass CO-SIGNATURE, surfaced to this handler as
+`cosigned is True`. The check is `cosigned is not True` (NEVER `not
+cosigned`): a truthy NON-bool -- the string "True", the string "1", a
+non-zero int, a non-empty list -- must NOT be accepted as a genuine
+co-signature. Anything that is not the
+literal boolean `True` fails closed with `cosign_required`, changing NOTHING.
+`breakglass_changing` is decided by comparing the PARSED key-set of the
+proposed break-glass file against the parsed key-set of the currently
+installed one (via `verify._key_blobs`), NOT raw bytes -- so a comment- or
+whitespace-only edit is correctly NOT treated as a change (and needs no
+co-signature), while any add/remove/replace of an actual key IS.
+
+**Disjointness, checked against the UNION of old and new break-glass.**
+`allowed_signers` and `breakglass_signers` MUST stay disjoint key-sets --
+this is precisely what makes the co-sign requirement unforgeable (a key in
+both sets would let the operator self-cosign a break-glass change; the prior
+self-cosign-bypass Critical was exactly a disjointness failure). This handler
+reuses `verify._key_blobs` -- the SAME parser `verify.verify_cosign` uses to
+enforce disjointness -- so the handler's notion of "which keys are in this file" is
+identical to the verifier's, by construction. Disjointness is enforced not
+just against the NEW break-glass set but against the UNION of the OLD and NEW
+break-glass sets: `allowed_new ∩ (breakglass_old ∪ breakglass_new) = ∅`. That
+union is what makes the "write allowed first, then break-glass" order safe on
+a PARTIAL write -- if the process dies (or the break-glass write fails) after
+allowed is installed but before break-glass is, the on-disk state is
+(allowed_new, breakglass_old), and the union check has already proven
+`allowed_new ∩ breakglass_old = ∅`, so that intermediate is still disjoint
+and safe. The only thing the stricter union rule additionally forbids is
+"demoting" an existing break-glass key straight into `allowed_signers` (a key
+that is in the old break-glass set may not appear in the new allowed set);
+that is deliberately blocked because it would necessarily pass through an
+overlapping intermediate -- the operator uses a fresh operational key
+instead, which is the safe direction.
+
+**Self-lockout prevention.** `allowed_signers` may never become empty:
+a proposed allowed set that parses to zero key blobs (empty file, or only
+comments/blank lines) is refused `would_lockout`, changing nothing -- the
+operator must always retain at least one operational signer or they could
+never command the CA again. (The break-glass set carries no such minimum --
+the operator MAY, with a co-signature, empty it.)
+
+**Fail-closed line parsing + KEY-MATERIAL validation (the silent-lockout
+hole).** `verify._key_blobs` SILENTLY SKIPS a line it cannot parse, AND it
+treats "a known keytype token followed by ANY token" as a key without ever
+validating the key material. Both are fine for the verifier's disjointness
+use, but for INSTALLING an anchor they are dangerous: a silently-dropped line
+means the operator believes they installed a key that never took effect, and
+-- worse -- a syntactically-plausible-but-UNLOADABLE line (bad base64, a
+`ssh-rsa`-token-over-an-ed25519-blob type mismatch, a truncated wire blob)
+would count toward the "≥1 principal" guard and INSTALL with `rc=0`, even
+though `ssh-keygen` cannot load it -- so an all-invalid file would leave the
+box permanently unauthenticable (a brick, with no in-scope recovery). This
+handler therefore independently walks every proposed line of BOTH files
+(iterating exactly as `_key_blobs` does) and FAILS CLOSED `bad_signers` on ANY
+non-comment/non-blank line that: contains a control character (NUL/C0/DEL);
+yields no key token (a line `_key_blobs` would silently skip); or whose key
+MATERIAL does not genuinely load. Material is checked two ways, both required:
+(1) a stdlib SSH-wire-format parse -- `base64.b64decode(validate=True)`, then
+a walk of the length-prefixed wire fields requiring exact consumption (rejects
+truncation/trailing garbage), the first field's embedded type string equal to
+the line's keytype token (rejects type mismatch), and -- for the CA's own
+`ssh-ed25519` keytype -- exactly a 32-byte key field; and (2) an authoritative
+`ssh-keygen -l -f` cross-check (list-argv, no shell, timeout-bounded) proving
+the real tool loads it. Only once every line passes BOTH is the
+`verify._key_blobs` set (still the authoritative disjointness/lockout/change
+input) trusted, so that set now counts only genuinely-loadable keys. See the
+"validation approach" note: for ed25519 the stdlib check already matches
+ssh-keygen's structural acceptance exactly; the subprocess is a defence-in-
+depth backstop for other keytypes and any wire-format edge.
+
+**All-validation-before-any-write.** Steps: read+validate the proposed
+allowed (bad_manifest if absent, bad_signers if unparseable, would_lockout if
+empty); read+validate the proposed break-glass if present (bad_signers if
+unparseable); decide `breakglass_changing`; gate on the co-signature
+(cosign_required); enforce disjointness (overlap). ONLY once every one of
+those passes is anything written. So on ANY validation failure the on-disk
+anchors are BYTE-UNCHANGED. The writes themselves are atomic (tmp -> fsync ->
+chmod -> rename -> dir-fsync, mirroring ca-bootstrap/registry.save): allowed
+first at 0644 root:root, then -- only if changing -- break-glass at 0444
+root:root.
+
+**Receipt.** On success a public `out_dir/rotate-receipt.json` is written
+(anchors are PUBLIC keys; nothing secret is ever emitted): `allowed_changed`
+(did the allowed key-set differ from what was installed), `breakglass_changed`
+(== breakglass_changing), `allowed_principals`/`breakglass_principals`
+(post-install key-blob counts), `cosigned` (was this op co-signed), `job_id`.
+
+**How `cosigned` reaches this handler.** `causb.dispatch` sets the child env
+var `CA_USB_COSIGNED=1` IFF the upstream break-glass co-signature verified
+(`cosigned is True`), else `0` (see dispatch's `_run_vetted_handler`). The
+`__main__` shim reads `os.environ.get("CA_USB_COSIGNED") == "1"` into the
+`cosigned` bool. `run()`'s own `cosigned=None` default is fail-closed: a
+direct caller that forgets to pass it gets "not co-signed".
+
+**Break-glass-ALONE lockout recovery, `bg_authorized`.** The pure
+lockout-recovery path -- the operator lost their PRIMARY key entirely and a
+break-glass-ALONE signature (no operator primary) authorizes the rotate --
+is enabled by the ORCHESTRATOR/verify layer (`box/bin/ca-usb-run` +
+`causb.verify.verify_breakglass_primary`) accepting a job whose only valid
+signature is a break-glass one, but ONLY for `operation == rotate-job-signers`.
+When it does, `causb.dispatch` sets `CA_USB_BG_AUTHORIZED=1`, surfaced to this
+handler as `bg_authorized is True`. In that mode this handler PERMITS an
+`allowed_signers` change (installing a fresh primary IS the recovery) but
+REFUSES any `breakglass_signers` key-set change (`bg_cannot_change_breakglass`,
+strict `is True`): a break-glass-alone signature must never be able to rewrite
+the break-glass set itself (that would let a single compromised break-glass key
+both authorize and install a new break-glass anchor). Changing break-glass
+still requires the new PRIMARY + a co-signature. The bg refusal is checked
+BEFORE the ordinary cosign gate, so it holds even if `cosigned` is somehow also
+True. This handler also still handles the CO-SIGNED path (primary + break-glass
+-> cosigned=True) unchanged. See tests/integration/rotate-drill.md.
+
+**Exit codes / reason vocabulary.** `EXIT_OK` (0), `EXIT_FAULT` (1 -- CLI-
+invocation misuse, i.e. wrong argc; unreachable in production since dispatch
+always supplies the fixed 4-element argv), `EXIT_BAD_MANIFEST` (2),
+`EXIT_COSIGN_REQUIRED` (3), `EXIT_OVERLAP` (4), `EXIT_WOULD_LOCKOUT` (5),
+`EXIT_BAD_SIGNERS` (6), `EXIT_WRITE_FAILED` (7). The harness's own contract
+only cares that a failure exits nonzero (any handler exit != 0 maps to
+`handler_failed` at the dispatch layer); the specific reason strings are the
+spec's vocabulary, kept small and distinct for anyone reading a log.
+"""
+
+import base64
+import binascii
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+# APPEND (not insert(0)): see box/handlers/ca-bootstrap's identical comment
+# for the full reasoning -- an explicit PYTHONPATH (this repo's own unit
+# tests, or the on-box test runner) must be honoured rather than shadowed by
+# a possibly-stale installed copy.
+sys.path.append("/usr/local/lib")
+
+from causb import config, verify  # noqa: E402  (see sys.path.append above)
+
+# Hard ceiling on the ssh-keygen load cross-check (mirrors
+# verify._SSH_KEYGEN_TIMEOUT_S): a hung ssh-keygen is just another failure
+# that fails closed to bad_signers.
+_SSH_KEYGEN_TIMEOUT_S = 30
+
+EXIT_OK = 0
+EXIT_FAULT = 1  # CLI-invocation misuse (wrong argc) -- mirrors ca-bootstrap's
+                # EXIT_FAULT; should never happen in production.
+EXIT_BAD_MANIFEST = 2
+EXIT_COSIGN_REQUIRED = 3
+EXIT_OVERLAP = 4
+EXIT_WOULD_LOCKOUT = 5
+EXIT_BAD_SIGNERS = 6
+EXIT_WRITE_FAILED = 7
+EXIT_BG_CANNOT_CHANGE_BREAKGLASS = 8  # a break-glass-ALONE authorized job
+                # (bg_authorized) proposed a breakglass_signers change -- the
+                # recovery path may install a fresh primary (allowed_signers)
+                # only; changing the break-glass set still needs the new
+                # primary + a co-signature.
+
+_REASON_BY_EXIT = {
+    EXIT_FAULT: "fault",
+    EXIT_BAD_MANIFEST: "bad_manifest",
+    EXIT_COSIGN_REQUIRED: "cosign_required",
+    EXIT_OVERLAP: "overlap",
+    EXIT_WOULD_LOCKOUT: "would_lockout",
+    EXIT_BAD_SIGNERS: "bad_signers",
+    EXIT_WRITE_FAILED: "write_failed",
+    EXIT_BG_CANNOT_CHANGE_BREAKGLASS: "bg_cannot_change_breakglass",
+}
+
+_ALLOWED_NAME = "allowed_signers"
+_BREAKGLASS_NAME = "breakglass_signers"
+_ALLOWED_MODE = 0o644
+_BREAKGLASS_MODE = 0o444
+
+
+class _Reject(Exception):
+    """An internal fail-closed rejection carrying the EXIT_* code to return.
+    Raised only inside the pure-validation phase (`_plan`), which never
+    touches disk, so any `_Reject` guarantees the on-disk anchors are
+    byte-unchanged. Mirrors causb.verify.VerifyError's carry-the-reason
+    idiom (kept module-local per this project's self-contained convention).
+    """
+
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+def _fsync_dir(path):
+    """Verbatim copy of causb.registry._fsync_dir / ca-bootstrap._fsync_dir
+    (each module's durable-write helper stays self-contained, per this
+    project's established convention)."""
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _silent_remove(*paths):
+    """Best-effort unlink, ignoring any path that doesn't exist or can't be
+    removed -- restores "nothing partial was left" on a write failure."""
+    for p in paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def _extract_key_blob(fields):
+    """Return `(keytype, blob)` for the first known SSH key type token in the
+    whitespace-split `fields` that is immediately followed by another token --
+    the EXACT (keytype, blob) pair verify._key_blobs would emit for this line
+    (reuses verify._KEY_TYPES so the two agree by construction). Returns None
+    if the line has no such token (a line _key_blobs would silently skip)."""
+    for i, token in enumerate(fields):
+        if token in verify._KEY_TYPES and i + 1 < len(fields):
+            return token, fields[i + 1]
+    return None
+
+
+def _ssh_wire_fields(raw):
+    """Split `raw` (a decoded SSH public-key blob) into its length-prefixed
+    wire fields: each field is a big-endian uint32 length followed by that
+    many bytes. Returns the list of field byte-strings, or None if `raw` is
+    NOT an exact sequence of such fields -- a truncated length prefix, a
+    declared length that overruns the blob, or trailing bytes after the last
+    field. Every SSH public-key type is a pure sequence of length-prefixed
+    fields (RFC 4253/8709: `ssh-ed25519` = [type][key]; `ssh-rsa` =
+    [type][e][n]; ecdsa/sk-* similarly), so exact consumption is a sound
+    generic structural check."""
+    fields = []
+    offset = 0
+    n = len(raw)
+    while offset < n:
+        if offset + 4 > n:
+            return None  # truncated length prefix
+        length = int.from_bytes(raw[offset:offset + 4], "big")
+        offset += 4
+        if offset + length > n:
+            return None  # declared length overruns the blob (truncated)
+        fields.append(raw[offset:offset + length])
+        offset += length
+    if offset != n:
+        return None  # trailing bytes (belt-and-suspenders; unreachable above)
+    return fields
+
+
+def _wire_format_ok(keytype, decoded):
+    """True iff `decoded` is a well-formed SSH public-key wire blob whose
+    embedded type string equals `keytype` (rejects a `ssh-rsa`-token-over-an-
+    ed25519-blob type mismatch), and -- for the CA's own `ssh-ed25519` keytype
+    -- whose single key field is exactly 32 bytes (matching ssh-keygen's own
+    ed25519 acceptance, so a wrong-length key field is rejected too)."""
+    fields = _ssh_wire_fields(decoded)
+    if not fields:
+        return False
+    try:
+        if fields[0].decode("ascii") != keytype:
+            return False
+    except UnicodeDecodeError:
+        return False
+    if keytype == "ssh-ed25519" and (len(fields) != 2 or len(fields[1]) != 32):
+        return False
+    return True
+
+
+def _ssh_keygen_can_load(keytype, blob):
+    """Authoritative backstop: does the REAL ssh-keygen accept `<keytype>
+    <blob>` as a loadable public key? Writes the single authorized_keys-style
+    line to a fresh temp file and runs `ssh-keygen -l -f <tmp>` (list-argv,
+    NEVER shell, timeout-bounded, output discarded). Returns True iff
+    ssh-keygen exits 0. ANY failure -- nonzero exit, timeout, a missing
+    binary, a temp-file write error -- returns False (fail closed: if we
+    cannot authoritatively confirm the key loads, we must not install it).
+    `keytype` is one of verify._KEY_TYPES and `blob` is already validated
+    base64, so the written line has no shell/newline-injection surface (it is
+    a file, not a command line)."""
+    fd, tmp = tempfile.mkstemp(prefix="causb-rotate-keycheck-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(f"{keytype} {blob}\n")
+        result = subprocess.run(
+            ["ssh-keygen", "-l", "-f", tmp],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=_SSH_KEYGEN_TIMEOUT_S,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+    finally:
+        _silent_remove(tmp)
+
+
+def _validate_key_material(keytype, blob):
+    """Fail closed `bad_signers` unless `blob` is genuinely loadable key
+    material for `keytype`: valid base64, a well-formed SSH wire blob whose
+    embedded type matches `keytype` (ed25519 key exactly 32 bytes), AND
+    accepted by a real `ssh-keygen -l` load. See the module docstring's
+    "KEY-MATERIAL validation" section."""
+    try:
+        decoded = base64.b64decode(blob, validate=True)
+    except (binascii.Error, ValueError):
+        raise _Reject(EXIT_BAD_SIGNERS)
+    if not _wire_format_ok(keytype, decoded):
+        raise _Reject(EXIT_BAD_SIGNERS)
+    if not _ssh_keygen_can_load(keytype, blob):
+        raise _Reject(EXIT_BAD_SIGNERS)
+
+
+def _load_proposed(path):
+    """Read + validate one PROPOSED anchor file at `path`. Returns
+    `(raw_bytes, blob_set)`: the exact bytes to install verbatim, and the
+    authoritative key-blob set (verify._key_blobs's own parse of the same
+    immutable file). Raises `_Reject(EXIT_BAD_SIGNERS)` on: an unreadable
+    file, non-UTF-8 content, a control character (NUL/C0/DEL) on any key
+    line, or ANY non-comment/non-blank line that does not yield a key blob
+    (fail closed -- never silently skip a line the operator meant to
+    install)."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        raise _Reject(EXIT_BAD_SIGNERS)
+
+    try:
+        # Iterate EXACTLY as verify._key_blobs does (text mode, universal
+        # newlines) so "a line _key_blobs would skip" == "a line this guard
+        # rejects" -- no divergence in which lines count as key lines.
+        with open(path, "r") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in line):
+                    raise _Reject(EXIT_BAD_SIGNERS)
+                kb = _extract_key_blob(line.split())
+                if kb is None:
+                    # A line _key_blobs would silently skip -- fail closed.
+                    raise _Reject(EXIT_BAD_SIGNERS)
+                # The key MATERIAL must genuinely load, or this "principal"
+                # would count toward the guard yet be unusable by
+                # ssh-keygen (the silent-lockout hole).
+                _validate_key_material(*kb)
+        blobs = verify._key_blobs(path)
+    except (OSError, UnicodeDecodeError):
+        raise _Reject(EXIT_BAD_SIGNERS)
+
+    return raw, blobs
+
+
+def _current_blobs(path):
+    """Parsed key-blob set of an ALREADY-INSTALLED anchor file. A missing
+    file -> the empty set (no such anchor configured yet). Any OTHER read/
+    parse failure -> fail closed `bad_signers`: this handler must never
+    proceed unable to reason about the trust anchors currently on disk (it
+    would be unable to prove disjointness or detect a break-glass change)."""
+    try:
+        return verify._key_blobs(path)
+    except FileNotFoundError:
+        return set()
+    except (OSError, UnicodeDecodeError):
+        raise _Reject(EXIT_BAD_SIGNERS)
+
+
+def _payload_path(payload_dir, name):
+    """Resolve a payload file, rejecting a symlink outright (defense-in-depth
+    on top of the harness's hardened-tar extraction: an anchor payload must
+    be a real regular file, never a symlink that could redirect a read to,
+    or an install-time write through, some other path). Returns the path if
+    it is a present regular file, or None if absent. Raises
+    `_Reject(EXIT_BAD_MANIFEST)` for a symlink or a present-but-non-regular
+    entry."""
+    path = os.path.join(payload_dir, name)
+    if os.path.islink(path):
+        raise _Reject(EXIT_BAD_MANIFEST)
+    if not os.path.exists(path):
+        return None
+    if not os.path.isfile(path):
+        raise _Reject(EXIT_BAD_MANIFEST)
+    return path
+
+
+def _plan(payload_dir, allowed_path, breakglass_path, cosigned, bg_authorized):
+    """Pure validation phase -- reads only, NEVER writes. Returns a dict
+    describing exactly what run() should install, or raises `_Reject(code)`.
+    Because this touches no anchor file, any rejection leaves the on-disk
+    anchors byte-unchanged."""
+    # 1. Proposed allowed_signers is REQUIRED.
+    allowed_payload = _payload_path(payload_dir, _ALLOWED_NAME)
+    if allowed_payload is None:
+        raise _Reject(EXIT_BAD_MANIFEST)
+    allowed_bytes, allowed_blobs = _load_proposed(allowed_payload)
+
+    # 3 (allowed half). Self-lockout guard: allowed can never be empty.
+    if not allowed_blobs:
+        raise _Reject(EXIT_WOULD_LOCKOUT)
+
+    # 4. Proposed breakglass_signers is OPTIONAL. Validate it if present.
+    bg_payload = _payload_path(payload_dir, _BREAKGLASS_NAME)
+    if bg_payload is not None:
+        bg_bytes, proposed_bg_blobs = _load_proposed(bg_payload)
+    else:
+        bg_bytes, proposed_bg_blobs = None, None
+
+    # Currently-installed key sets (missing file -> empty). Read here, before
+    # any gate, so change-detection and disjointness both reason over the
+    # real on-disk state.
+    current_bg_blobs = _current_blobs(breakglass_path)
+    current_allowed_blobs = _current_blobs(allowed_path)
+
+    # 2. Break-glass change detection, by PARSED key-set (not raw bytes).
+    if bg_payload is not None:
+        breakglass_changing = proposed_bg_blobs != current_bg_blobs
+        new_bg_blobs = proposed_bg_blobs
+    else:
+        breakglass_changing = False
+        new_bg_blobs = current_bg_blobs
+
+    # 2 (break-glass-alone gate, checked BEFORE the cosign gate). A break-glass-ALONE
+    # authorized job (bg_authorized) may change ONLY allowed_signers -- it may
+    # NOT change the break-glass key-set itself. Refuse fail-closed here, ahead
+    # of the ordinary cosign gate, so a bg-authorized break-glass change is
+    # ALWAYS bg_cannot_change_breakglass, never slips through even on a stray
+    # cosigned=True. STRICT `is True`: only a genuine bg authorization (a real
+    # bool from CA_USB_BG_AUTHORIZED == "1") takes this path; a truthy non-bool
+    # falls through to the cosign gate below, which -- with cosigned not True --
+    # still refuses the change (cosign_required). Either way, fail closed.
+    if bg_authorized is True and breakglass_changing:
+        raise _Reject(EXIT_BG_CANNOT_CHANGE_BREAKGLASS)
+
+    # 2 (gate). ANY break-glass key-set change needs a co-signature. STRICT
+    # `is not True` -- a truthy non-bool must fail closed (module docstring).
+    if breakglass_changing and cosigned is not True:
+        raise _Reject(EXIT_COSIGN_REQUIRED)
+
+    # 5. Disjointness against the UNION of old and new break-glass, so the
+    # allowed-first write order has no unsafe (overlapping) intermediate on a
+    # partial write (module docstring).
+    disjoint_against = current_bg_blobs | new_bg_blobs
+    if allowed_blobs & disjoint_against:
+        raise _Reject(EXIT_OVERLAP)
+
+    return {
+        "allowed_bytes": allowed_bytes,
+        "allowed_blobs": allowed_blobs,
+        "allowed_changed": allowed_blobs != current_allowed_blobs,
+        "bg_bytes": bg_bytes,
+        "breakglass_changing": breakglass_changing,
+        "new_bg_blobs": new_bg_blobs,
+    }
+
+
+def _atomic_install(path, data, mode):
+    """Durably install `data` at `path` with exactly `mode` (root:root best-
+    effort): tmp sibling -> write -> fsync file -> chmod -> rename -> fsync
+    dir (mirrors ca-bootstrap / causb.registry.save). The explicit chmod on
+    the tmp file BEFORE the rename (not reliance on the O_CREAT mode, which
+    umask masks) means the final path is never visible with a wrong mode --
+    os.replace preserves the source inode's mode across a same-filesystem
+    rename. Raises OSError on any failure, after unlinking the tmp so no
+    partial file is left behind."""
+    dir_path = os.path.dirname(path)
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(dir_path, exist_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+        _fsync_dir(dir_path)
+    except OSError:
+        _silent_remove(tmp)
+        raise
+    # Best-effort root:root (defense-in-depth; the mode bits above are the
+    # real access gate). A PermissionError running non-root (e.g. under test)
+    # must NOT fail an otherwise-complete install.
+    try:
+        os.chown(path, 0, 0)
+    except OSError:
+        pass
+
+
+def _atomic_write_json(dest_dir, name, obj):
+    """tmp -> rename JSON write for the out_dir receipt (mirrors set-time/
+    status's identical idiom)."""
+    path = os.path.join(dest_dir, name)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def run(job, payload_dir, out_dir, *, allowed_path=config.ALLOWED,
+        breakglass_path=config.BREAKGLASS, cosigned=None, bg_authorized=None):
+    """Handler entrypoint body (break-glass-alone recovery included). `allowed_path`/
+    `breakglass_path` are DI seams (production `__main__` uses config.ALLOWED
+    /config.BREAKGLASS; tests point them at temp paths). `cosigned` is the
+    upstream break-glass co-signature result and `bg_authorized` the upstream
+    break-glass-ALONE authorization result (the `__main__` shim reads them
+    from CA_USB_COSIGNED / CA_USB_BG_AUTHORIZED; a direct caller that omits
+    either gets the fail-closed `None` default -- treated as not-granted).
+    `job` is used only for the receipt's `job_id`.
+
+    Returns one of the EXIT_* codes; never raises for any foreseeable
+    failure. On ANY validation failure the on-disk anchors are BYTE-
+    UNCHANGED (all validation precedes any write)."""
+    # Phase 1: pure validation (no disk writes). Any _Reject here means the
+    # anchors were never touched.
+    try:
+        plan = _plan(payload_dir, allowed_path, breakglass_path, cosigned, bg_authorized)
+    except _Reject as rej:
+        return rej.code
+
+    # Phase 2: atomic install. Allowed first (0644), then -- only if its
+    # key-set is changing -- break-glass (0444). The union disjointness check
+    # in _plan guarantees the (allowed_new, breakglass_old) intermediate that
+    # a partial write would leave is itself disjoint and safe.
+    try:
+        _atomic_install(allowed_path, plan["allowed_bytes"], _ALLOWED_MODE)
+        if plan["breakglass_changing"]:
+            _atomic_install(breakglass_path, plan["bg_bytes"], _BREAKGLASS_MODE)
+    except OSError:
+        return EXIT_WRITE_FAILED
+
+    # Phase 3: public receipt (anchors are public keys; nothing secret). A
+    # receipt-write failure after a successful install still reports nonzero
+    # (write_failed), but the installed anchors are valid and disjoint.
+    receipt = {
+        "allowed_changed": plan["allowed_changed"],
+        "breakglass_changed": plan["breakglass_changing"],
+        "allowed_principals": len(plan["allowed_blobs"]),
+        "breakglass_principals": len(plan["new_bg_blobs"]),
+        "cosigned": cosigned is True,
+        "bg_authorized": bg_authorized is True,
+        "job_id": job.get("job_id") if isinstance(job, dict) else None,
+    }
+    try:
+        _atomic_write_json(out_dir, "rotate-receipt.json", receipt)
+    except OSError:
+        return EXIT_WRITE_FAILED
+
+    return EXIT_OK
+
+
+def main(argv):
+    if len(argv) != 4:
+        print(f"usage: {argv[0]} <job.json> <payload_dir> <out_dir>", file=sys.stderr)
+        return EXIT_FAULT
+    _, job_path, payload_dir, out_dir = argv
+
+    try:
+        with open(job_path, "rb") as f:
+            job = json.loads(f.read())
+    except (OSError, ValueError):
+        print("rotate-job-signers: bad_manifest", file=sys.stderr)
+        return EXIT_BAD_MANIFEST
+    if not isinstance(job, dict):
+        print("rotate-job-signers: bad_manifest", file=sys.stderr)
+        return EXIT_BAD_MANIFEST
+
+    # The break-glass co-signature result, threaded by causb.dispatch's
+    # vetted-handler pass-through as CA_USB_COSIGNED=1 (only for a genuine
+    # `cosigned is True` upstream; "0"/unset otherwise). Compared with a
+    # strict `== "1"` so nothing but that exact value yields co-signed.
+    cosigned = os.environ.get("CA_USB_COSIGNED") == "1"
+
+    # The break-glass-ALONE authorization, threaded the same way as
+    # CA_USB_BG_AUTHORIZED=1 (only for a genuine `bg_authorized is True`
+    # upstream). INDEPENDENT of CA_USB_COSIGNED. Strict `== "1"`: nothing but
+    # that exact value grants the bg-alone recovery mode (allowed-only change).
+    bg_authorized = os.environ.get("CA_USB_BG_AUTHORIZED") == "1"
+
+    try:
+        rc = run(job, payload_dir, out_dir, cosigned=cosigned, bg_authorized=bg_authorized)
+    except OSError as exc:
+        # Belt-and-suspenders outer net (mirrors ca-bootstrap/set-time): run()
+        # is designed to catch every foreseeable OSError itself.
+        print(f"rotate-job-signers: fault: {exc}", file=sys.stderr)
+        return EXIT_WRITE_FAILED
+
+    if rc != EXIT_OK:
+        print(f"rotate-job-signers: {_REASON_BY_EXIT.get(rc, 'fault')}", file=sys.stderr)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

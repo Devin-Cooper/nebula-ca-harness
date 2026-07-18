@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 500" width="940" height="500" font-family="Helvetica,Arial,sans-serif">
+<rect width="940" height="500" fill="#fff"/>
+<rect x="4" y="4" width="932" height="492" rx="18" fill="none" stroke="#cbd5e1" stroke-width="2"/>
+<text x="30" y="48" font-size="30" font-weight="bold" fill="#0f172a">The trust boundary</text>
+<text x="30" y="78" font-size="18" fill="#64748b">The laptop and every stick are outside it. The key is inside it, and never leaves.</text>
+<rect x="24" y="100" width="410" height="330" rx="12" fill="#fffbeb" stroke="#d97706" stroke-width="1.5" stroke-dasharray="6 5"/>
+<rect x="506" y="100" width="410" height="330" rx="12" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+<text x="44" y="128" font-size="15" font-weight="bold" fill="#d97706" letter-spacing="1">OUTSIDE &#183; UNTRUSTED</text>
+<text x="526" y="128" font-size="15" font-weight="bold" fill="#16a34a" letter-spacing="1">INSIDE &#183; TRUSTED</text>
+<line x1="470" y1="146" x2="470" y2="424" stroke="#0f172a" stroke-width="3" stroke-dasharray="3 8"/>
+<text x="484" y="290" font-size="12" font-weight="bold" fill="#64748b" transform="rotate(90 484 290)">AIR GAP</text>
+<rect x="58" y="156" width="86" height="54" rx="6" fill="#fff" stroke="#d97706" stroke-width="3"/><rect x="66" y="164" width="70" height="38" rx="2" fill="#d97706" opacity="0.10"/><path d="M48 224 L154 224 L144 212 L58 212 Z" fill="#fff" stroke="#d97706" stroke-width="3" stroke-linejoin="round"/>
+<rect x="218" y="173" width="16" height="32" rx="2" fill="#d97706"/><rect x="178" y="164" width="42" height="50" rx="5" fill="#fff" stroke="#d97706" stroke-width="3"/><circle cx="191" cy="189" r="5" fill="none" stroke="#d97706" stroke-width="2.5"/>
+<circle cx="52" cy="270" r="3.5" fill="#d97706"/><text x="66" y="275" font-size="16" fill="#0f172a">Your laptop (builds &amp; signs jobs)</text>
+<circle cx="52" cy="306" r="3.5" fill="#d97706"/><text x="66" y="311" font-size="16" fill="#0f172a">Every USB stick, and its filesystem</text>
+<circle cx="52" cy="342" r="3.5" fill="#d97706"/><text x="66" y="347" font-size="16" fill="#0f172a">Anything written to outbox/ (public)</text>
+<rect x="548" y="152" width="118" height="84" rx="8" fill="#fff" stroke="#16a34a" stroke-width="3"/><line x1="562" y1="172" x2="622" y2="172" stroke="#16a34a" stroke-width="3" opacity="0.5"/><line x1="562" y1="188" x2="622" y2="188" stroke="#16a34a" stroke-width="3" opacity="0.5"/><line x1="562" y1="204" x2="622" y2="204" stroke="#16a34a" stroke-width="3" opacity="0.5"/><circle cx="644" cy="174" r="6" fill="#16a34a"/>
+<circle cx="704" cy="190" r="11" fill="none" stroke="#d97706" stroke-width="3.5"/><line x1="714" y1="190" x2="738" y2="190" stroke="#d97706" stroke-width="3.5"/><line x1="731" y1="190" x2="731" y2="200" stroke="#d97706" stroke-width="3.5"/><line x1="738" y1="190" x2="738" y2="200" stroke="#d97706" stroke-width="3.5"/>
+<circle cx="534" cy="262" r="3.5" fill="#16a34a"/><text x="548" y="267" font-size="16" fill="#0f172a">The air-gapped box</text>
+<circle cx="534" cy="295" r="3.5" fill="#16a34a"/><text x="548" y="300" font-size="16" fill="#0f172a">ca.key &#8212; born here, never leaves</text>
+<circle cx="534" cy="328" r="3.5" fill="#16a34a"/><text x="548" y="333" font-size="16" fill="#0f172a">The on-box trust anchors</text>
+<circle cx="534" cy="361" r="3.5" fill="#16a34a"/><text x="548" y="366" font-size="16" fill="#0f172a">The reviewed handler code</text>
+<text x="470" y="460" text-anchor="middle" font-size="16" fill="#2563eb"><tspan font-weight="bold">&#8594; Signed jobs come IN</tspan> &#8212; verified on-box before anything runs</text>
+<text x="470" y="484" text-anchor="middle" font-size="16" fill="#16a34a"><tspan font-weight="bold">&#8592; Only public data goes OUT</tspan> (certs, status) &#8212; never the key</text>
+</svg>

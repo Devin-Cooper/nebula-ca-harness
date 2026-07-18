@@ -1,0 +1,120 @@
+# ca-usb-job@.service -- the systemd unit for the air-gapped Nebula CA USB
+# job harness.
+#
+# Instantiated once per triggering partition device name (%i, e.g. "sda1")
+# by box/udev/99-ca-usb-job.rules's ENV{SYSTEMD_WANTS}+="ca-usb-job@%k.service".
+# ExecStart runs /usr/local/sbin/ca-usb-run (box/bin/ca-usb-run), the full
+# mount->verify->K1->dispatch->commit->deliver orchestrator.
+# This unit file is the final systemd wiring.
+#
+# RemainAfterExit=yes is load-bearing, not cosmetic: Type=oneshot without it
+# would run ExecStopPost (LED -> IDLE) the instant ExecStart exits, wiping
+# out whatever terminal LED state (BUSY/ERROR/SUCCESS-then-SAFE_REMOVE) was
+# just set before the operator could ever see it. With RemainAfterExit=yes,
+# a SUCCESSFUL ExecStart (exit 0) instead leaves the unit `active (exited)`
+# and defers ExecStopPost until something actually stops the unit -- here,
+# BindsTo=dev-%i.device stopping it on stick REMOVAL (a mid-run yank stops
+# and cleans up the same way). This is why ca-usb-run's stub deliberately
+# exits 0 on every EXPECTED terminal outcome (busy / K1-timeout / success),
+# reserving a nonzero exit for a genuine internal fault -- verified
+# empirically against this box's systemd 257: a failed
+# oneshot start runs ExecStopPost immediately regardless of RemainAfterExit,
+# which would defeat a held ERROR/BUSY LED exactly as badly as it would
+# defeat a held SUCCESS/SAFE_REMOVE one.
+[Unit]
+Description=Nebula CA USB job harness for %i
+After=dev-%i.device
+BindsTo=dev-%i.device
+# Hard boot-ordering guarantee (belt-and-suspenders): a stick
+# present at COLD BOOT must not let its job reach commit() before the one-shot
+# ca-usb-reconcile.service has rebuilt the seq/consumed-jobs caches from DONE
+# markers (restart recovery). In practice the K1 human-press gate (<=60 s)
+# already lets ms-scale reconcile win, but this edge makes it explicit rather
+# than timing-dependent. A completed RemainAfterExit=no oneshot satisfies this
+# ordering for post-boot inserts too (it is `inactive` by then, ordering is a
+# no-op), so it never delays a normal insertion.
+After=ca-usb-reconcile.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/ca-usb-run /dev/%i
+ExecStopPost=/usr/local/sbin/ca-usb-run --cleanup
+# Explicit watchdog: generous enough for a real per-op run (config default
+# 300 s; ca-bootstrap/rotate-ca longer) plus the 60 s K1 window plus mount/
+# verify/deliver overhead. NOTE: RuntimeMaxSec= is INERT on
+# Type=oneshot -- it only bounds long-running (non-oneshot) service types --
+# so the watchdog here MUST be TimeoutStartSec=, which bounds how long
+# systemd will wait for ExecStart itself to finish.
+TimeoutStartSec=600
+
+# --- Known-safe sandbox -----------------
+# Verified live via systemd-run against this unit's EXACT property set:
+# mount(8)/losetup a real vfat image, write
+# /sys/class/leds/user_led/*, non-blocking-read a real evdev node, and
+# flock(2) all succeed under this exact sandbox. Do NOT add PrivateDevices=,
+# ProtectKernelTunables=, or a bare SystemCallFilter=@system-service -- all
+# three are independently verified (design review + systemd-run tests)
+# to break mount/evdev/LED/the mount(2) syscall class.
+ProtectSystem=strict
+ReadWritePaths=/etc/nebula-ca /var/lib/nebula-ca /run/ca-usb
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+PrivateMounts=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+# RestrictSUIDSGID is DELIBERATELY OMITTED (it was here and broke extraction).
+# Its seccomp filter must inspect the file-creation MODE to reject SUID/SGID
+# bits, but openat2(2) carries mode inside a by-POINTER `struct open_how` that
+# seccomp cannot dereference -- so systemd blocks openat2 outright (ENOSYS).
+# causb.extract REQUIRES openat2 (RESOLVE_BENEATH|NO_SYMLINKS|NO_XDEV is its
+# entire kernel-enforced confinement, with no fallback path), so RestrictSUIDSGID
+# and the hardened extractor are mutually exclusive. Compensating controls: the
+# payload TemporaryFileSystem below is nosuid,nodev and the stick mount is nosuid
+# (mountctl), so a SUID file cannot be created-and-executed with elevated
+# privilege regardless; run-script also drops to the unprivileged nebula-job.
+LockPersonality=yes
+NoNewPrivileges=yes
+# RestrictNamespaces=pid, NOT =yes. A non-privileged run-script's child is wrapped
+# in `unshare --pid --fork --kill-child` (causb.dispatch._UNSHARE_PIDNS) so the
+# harness can reap EVERY process the untrusted `nebula-job` script spawns -- that
+# needs CLONE_NEWPID. `=yes` blocks it via seccomp, so every real run-script died
+# `handler_failed` before it ran (the unit suite mocks dispatch.run for run-scripts,
+# so this was invisible until the enforcement gate; verified on-box 2026-07-17: `unshare
+# --pid` fails under =yes, succeeds under =pid). `=pid` allows ONLY the pid
+# namespace the ROOT wrapper creates and still denies mnt/net/user/uts/ipc/cgroup
+# (the ones an escape would need); the dropped nebula-job child holds no
+# CAP_SYS_ADMIN, so it cannot create any namespace regardless. Vetted handlers
+# never unshare, which is why status/ca-bootstrap/etc. worked under =yes.
+RestrictNamespaces=pid
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SETUID CAP_SETGID CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SYS_TIME
+
+# RuntimeDirectory=ca-usb ensures /run/ca-usb
+# exists, root:root, belt-and-suspenders alongside box/tmpfiles.d/ca-usb.conf
+# which already provisions it 0700 independent of this unit). Verified live
+# that WITHOUT the two lines below, systemd's default
+# RuntimeDirectory= behavior actively fights the tmpfiles.d provisioning and
+# reintroduces the exact "flock-on-ro" class of bug this closes: it (a) forces
+# the directory to its default 0755 on every single unit start, silently
+# relaxing the 0700 tmpfiles.d sets, and (b) recursively DELETES
+# /run/ca-usb -- the flock directory shared by every ca-usb-job@*.service
+# instance -- the moment ANY ONE instance stops (e.g. stick A's job
+# finishes and is pulled while stick B's instance is still mid-run), which
+# would silently break the global flock's cross-instance serialization the
+# very next time a stick is inserted. RuntimeDirectoryPreserve=yes +
+# RuntimeDirectoryMode=0700 make RuntimeDirectory= a pure no-op against the
+# tmpfiles.d-provisioned directory (same mode, never torn down) instead of
+# fighting it.
+RuntimeDirectory=ca-usb
+RuntimeDirectoryPreserve=yes
+RuntimeDirectoryMode=0700
+
+# Dedicated payload tmpfs ("not shared RuntimeDirectory") -- private to
+# THIS unit instance's own mount namespace (PrivateMounts=yes above), so
+# concurrent instances (two sticks) never see each other's in-flight copy.
+# ca-usb-run's stub does not populate this yet (no mounting/verification
+# yet); ExecStopPost=--cleanup best-effort-clears its contents on
+# every stop regardless.
+TemporaryFileSystem=/run/ca-usb-tmp:size=32M,nosuid,nodev

@@ -1,0 +1,616 @@
+#!/usr/bin/env python3
+"""caj -- online (Mac-side) job builder + signer for the air-gapped Nebula CA
+harness.
+
+caj reads a simple job SPEC file plus staged payload files (host pubkeys, a
+run-script's script file, ...), assembles the wire-format `manifest.json`
++ `payload/` bundle, packs it into `job.tar` with clean member names, signs
+it with `ssh-keygen -Y sign` (Ed25519, namespace causb.config.NS ==
+"nebula-ca-job" -- the same namespace causb.verify checks against), and
+writes both `job.tar` and `job.tar.sig` to `<stick>/inbox/`. This is the ONLY
+half of the wire contract caj is responsible for: the box-side verify/
+extract/dispatch/commit pipeline (causb.extract, causb.commitlog, ...) is
+implemented and tested entirely on the box.
+
+**`--breakglass <key>` (break-glass co-signature).** A privileged/
+break-glass-touching job (e.g. a `rotate-job-signers` job that changes
+`breakglass_signers`, or a `privileged` run-script) needs a SECOND detached
+signature from the offline break-glass key, alongside the operator's primary
+signature -- the box already gates on this (`causb.verify.verify_cosign`).
+When `--breakglass <key>` is given, build_command ALSO signs the SAME
+job.tar bytes with that key, in the SAME `nebula-ca-job` namespace, and
+delivers the result as `<stick>/inbox/job.tar.bg.sig` alongside `job.tar` +
+`job.tar.sig` (see `_sign_breakglass` and `_deliver_atomic`). Without
+`--breakglass`, behavior is entirely unchanged -- no `job.tar.bg.sig` is ever
+produced, and a job that actually needed a co-signature correctly fails the
+box's `cosign_required` gate instead of silently going out uncosigned.
+
+**Platform note -- why caj imports only causb.config and causb.manifest.**
+caj's production runtime is the operator's Mac (macOS), not the air-gapped
+Linux box. `causb.extract.extract()` drives a raw Linux-only
+`openat2` syscall (hardcoded syscall number 437) via ctypes -- meaningless,
+and unsafe to invoke, on Darwin. caj therefore never imports causb.extract
+(or causb.collect/causb.commitlog/causb.freshness, which are equally
+box-only in scope). Its own guarantee that job.tar's member names are clean
+(no leading "./", no absolute path, no "..", depth <= causb.config.CAPS
+["depth"]) comes from constructing every tar member with an explicit,
+already-safe `arcname=` (see `_build_job_tar`), not from re-running the
+box's hardened extractor locally. What caj DOES call, as a portable,
+pure-Python (json/uuid only) self-check before ever touching the USB stick,
+is `causb.manifest.parse()` on the manifest bytes it is about to sign --
+if the box's own strict parser would reject this manifest, caj
+refuses to sign it, rather than silently producing a bundle the box will
+later bounce. causb.verify.verify() is NOT called by caj itself for
+the same portability reason (it doesn't need an allowed_signers file to
+build a job, and the Mac -- outside the trust boundary -- has no
+business holding a copy of the box's trust anchor); it is the box, and this
+project's own test suite, that verify a caj-produced signature.
+
+**Spec file format.** Plain "key: value" lines (no PyYAML, no eval -- only
+str.partition(":")). Blank lines and lines starting with "#" are ignored.
+Reserved top-level keys:
+
+  name        optional human-readable label -> manifest bundle_id (falls
+              back to the job_id if omitted).
+  operation   required -> jobs[0].operation (e.g. "sign-hosts", "run-script").
+  box         optional, defaults to causb.config.BOX_NAME -> jobs[0]'s
+              manifest.box.
+  payload     optional comma-separated list of STAGED file basenames (e.g.
+              "alice.pub,bob.pub") -> jobs[0].payload. Each name is resolved
+              relative to the spec file's OWN directory (the natural
+              "staging area": an operator drops a spec file next to the
+              pubkeys/script it references), must be a plain basename
+              (no "/", not "." or ".."), and may appear at most ONCE -- a
+              duplicate basename is a rejected operator typo, not a silently
+              doubled (and box-rejected) tar member.
+  entrypoint  optional -> jobs[0].entrypoint (must be one of `payload`'s
+              names for operation=="run-script"; caj checks this itself,
+              ahead of the identical check inside causb.manifest.parse(),
+              purely for a clearer CLI error message).
+
+Any OTHER key of the form `args.<name>: <value>` populates
+jobs[0].args[<name>] = <value> -- a plain string in every case except one:
+an `args.<name>` value of exactly `true` or `false` is emitted as a JSON
+boolean; every other value is a string. The match is case-sensitive and
+exact -- `True`, `TRUE`, `yes`, `1`, and any value merely containing
+"true"/"false" as a substring (e.g. a value with leading/trailing content)
+are all left as plain strings, same as before. This is the ONLY coercion
+`_parse_spec` performs: no numbers, no `null`, nothing else is ever
+special-cased -- e.g. `args.groups: admins` or `args.duration: 8760h` stay
+strings, and a value with a comma (such as multiple nebula groups) is left
+as one comma-joined string rather than split into a JSON list, since that
+is exactly the shape nebula-cert's own `-groups` flag already expects.
+
+This narrow coercion exists for exactly two args, both booleans the box
+itself requires be a REAL JSON boolean, never a truthy string
+(a truthy string must never grant privilege) -- `causb.dispatch.
+_is_privileged` requires `args["privileged"] is True` before a `run-script`
+may run as root (and additionally requires a break-glass co-signature,
+`--breakglass`, or the box refuses `cosign_failed`), and `box/handlers/
+rotate-ca` requires `isinstance(args["compromise"], bool)`. Before this
+coercion existed, EVERY `args.<name>` value -- including these two -- was
+stored as a plain string, so `args.privileged: true` reached the box as the
+STRING `"true"`: both strict checks correctly refused it (fail-SAFE -- never
+MORE privilege than intended), but that made a privileged run-script and a
+`rotate-ca --compromise` literally unreachable via caj (the gap this
+coercion closes). `causb.manifest.parse()` places no constraint on
+args' internal shape at all (not even that it exists), so this mapping --
+including which two values get coerced -- is a pure caj convention, not a
+wire-contract requirement; a future third boolean arg would need the exact
+same `true`/`false` spelling to get the same treatment.
+
+**seq bookkeeping ("seq = max(repo ca-state/last-seq,
+highest-built-unconfirmed)+1").** Two small counter files live in a
+`ca-state/` directory (by default `<repo_root>/ca-state/`, i.e. a sibling of
+this script's own `mac/` directory -- overridable via the `CAJ_STATE_DIR`
+environment variable, used by this project's own test suite to avoid ever
+touching the real repo checkout's ca-state during a test run):
+
+  ca-state/last-seq        the REPO's last box-CONFIRMED seq. This file is
+                            written by caj-recv (a separate, later tool) as
+                            it reconciles what the box actually reports;
+                            caj itself only ever READS it (default 0 if
+                            absent -- a fresh repo has no confirmed history).
+  ca-state/last-built-seq   caj's OWN simple local counter: "the highest seq
+                            caj has built so far, whether or not it has been
+                            confirmed yet" -- exactly the spec's
+                            "highest-built-unconfirmed" tracking, kept as
+                            deliberately simple as the spec invites: a
+                            single integer file, bumped by caj after EVERY
+                            successful build (including a --retry).
+
+Each `build` computes `seq = max(last-seq, last-built-seq) + 1` and -- BEFORE
+building, signing, or delivering anything -- persists that value back to
+`last-built-seq` (the "reservation"), all under the single flock. Reserving
+up front is what makes delivery crash-safe: a crash or failure ANYWHERE in
+the build/sign/deliver that follows can at worst WASTE the reserved seq --
+the box only requires a monotonically INCREASING `seq` (`seq > last
+committed`), so a gap in the sequence is harmless -- and, critically, no two
+DELIVERED jobs can ever bear the same seq. (An earlier revision recorded the
+seq only AFTER copying the job onto the stick; that left a crash window
+between "job delivered" and "seq recorded" in which the next build would
+REUSE the seq and strand the already-delivered, legitimately-signed job as
+`stale_seq` at the box -- reproduced in review, now fixed.) A deterministic
+pre-delivery failure (e.g. a manifest self-check rejection) likewise merely
+wastes the reserved seq, which is preferable to reintroducing any window in
+which a delivered job's seq could be reused. Both
+files are read/written with the same plain "read int, default 0 if absent" /
+"atomic tmp-then-rename" convention causb.commitlog/causb.freshness use for
+their own box-side seq state, for consistency across the codebase -- though
+unlike that box-side state (which must be crash-atomic), this
+Mac-side bookkeeping is not itself safety-critical (nothing downstream ever
+trusts THESE files' bytes; the box only ever trusts the seq baked into a
+signed manifest), so no fsync is performed here, only a plain atomic
+os.replace().
+
+**--retry <job_id>.** Reuses the given job_id verbatim (validated as a
+syntactically well-formed uuid4 -- causb.manifest.parse()'s own `_is_uuid4`
+check, exercised via the pre-sign self-check, is still the final authority)
+instead of minting a fresh uuid4, but goes through the exact same seq
+computation as any other build -- so a retried job still "advances seq"
+(a re-delivery of an already-committed job_id must go through a NEW
+seq to not appear stale to the box's freshness check, while the box's own
+commit-log replays the ORIGINAL cached bytes for that job_id rather than
+re-running anything).
+
+**job.tar construction ("CLEAN member names ONLY").** Built via
+`tarfile.open(path, "w")` with an explicit `arcname=` per file -- exactly
+"manifest.json" and "payload/<basename>" for each staged payload file. This
+project never calls `tar.add(directory)` (which can introduce a "./"-rooted
+name or a bare directory-type member -- the box's causb.extract rejects any
+non-"manifest.json"/"payload/..." shape AND any non-regular-file member,
+including a directory entry for "payload" itself) -- only individual,
+already-validated-basename files are ever added, one by one.
+
+**Atomic delivery to the stick.** `job.tar` and `job.tar.sig` are placed
+into `<stick>/inbox/` each via a temp-name write + `os.replace()` (atomic
+within the one inbox directory), with the SIGNATURE delivered LAST. A crash
+or USB-yank mid-delivery therefore leaves, at worst, a `job.tar` with no (or
+a stale) `job.tar.sig` -- which the box rejects fail-closed (it never acts on
+an unsigned or signature-mismatched job) -- never a truncated/partial final
+file, and never a signature paired with a missing/truncated tar. When a
+`job.tar.bg.sig` is also being delivered (`--breakglass`), it is placed
+BETWEEN `job.tar` and `job.tar.sig`: `job.tar` -> `job.tar.bg.sig` ->
+`job.tar.sig` (primary sig still LAST). The primary signature is the box's
+one completeness signal regardless of whether a co-signature rides along, so
+it must remain the final file written -- a crash after the bg.sig but before
+the primary sig still leaves the box with no primary `job.tar.sig` to see,
+and it fails closed exactly as it would with no break-glass sig at all.
+
+**Single-writer.** All of the above -- reading the two seq counters,
+building+signing+placing the job, and bumping last-built-seq -- happens
+under one exclusive `fcntl.flock()` on `ca-state/.caj.lock`, so two
+concurrent `caj build` invocations (e.g. two terminals) can't race on seq
+allocation or interleave writes to the same stick.
+"""
+
+import argparse
+import fcntl
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import uuid
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+
+# causb (box/lib/causb) is this repo's own package, not something installed
+# on PATH/site-packages -- caj runs standalone on the operator's Mac with no
+# PYTHONPATH set up, so it must find it itself, relative to its own location,
+# regardless of the caller's cwd or environment.
+sys.path.insert(0, os.path.join(REPO_ROOT, "box", "lib"))
+
+from causb import config  # noqa: E402  (see sys.path.insert above)
+from causb import manifest as causb_manifest  # noqa: E402
+
+_LAST_SEQ_NAME = "last-seq"
+_LAST_BUILT_SEQ_NAME = "last-built-seq"
+_LOCK_NAME = ".caj.lock"
+
+
+class CajError(Exception):
+    """A user-facing caj CLI error: bad spec, missing/unsafe payload entry,
+    a manifest that would fail the box's own parser, a signing failure, ...
+    Caught once at main() and reported to stderr with exit code 1 -- never a
+    raw traceback for one of these expected, nameable failure modes."""
+
+
+# --- spec file parsing ---
+
+
+def _coerce_arg_value(value: str):
+    """An `args.<name>` value of exactly `true` or `false` is emitted as a
+    JSON boolean; every other value is a string (module docstring's
+    `args.<name>` convention). Case-sensitive, exact-match only: `True`,
+    `TRUE`, `yes`, `1`, `truthy`, and anything else are all left as plain
+    strings unchanged -- the box has exactly two boolean args
+    (`privileged`, `compromise`), and an operator who genuinely wants the
+    literal string "true" is not a real case for either of them, so nothing
+    beyond this exact pair of literals is ever coerced (no numbers, no
+    `null`, nothing else)."""
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    return value
+
+
+def _parse_spec(spec_path: str) -> dict:
+    """Parse a job spec file: plain "key: value" lines, blank lines and
+    "#"-comments ignored. See module docstring for the reserved top-level
+    keys (name/operation/box/payload/entrypoint) and the `args.<name>`
+    convention. Returns a dict with `payload` already split into a
+    validated list of basenames and `args` collected into its own nested
+    dict; every other reserved key is a plain string (or absent). An
+    `args.<name>` value of exactly `true` or `false` is emitted as a JSON
+    boolean; every other value is a string (see `_coerce_arg_value`).
+    """
+    fields = {"args": {}}
+    try:
+        spec_file = open(spec_path)
+    except OSError as exc:
+        raise CajError(f"cannot read spec file {spec_path!r}: {exc}")
+
+    with spec_file:
+        for lineno, raw_line in enumerate(spec_file, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ":" not in line:
+                raise CajError(
+                    f"{spec_path}:{lineno}: expected 'key: value', got {raw_line!r}"
+                )
+            key, _, value = line.partition(":")
+            key = key.strip()
+            value = value.strip()
+            if not key:
+                raise CajError(f"{spec_path}:{lineno}: empty key")
+            if key.startswith("args."):
+                fields["args"][key[len("args."):]] = _coerce_arg_value(value)
+            else:
+                fields[key] = value
+
+    if "operation" not in fields:
+        raise CajError(f"spec file {spec_path!r} is missing required 'operation'")
+    fields.setdefault("box", config.BOX_NAME)
+    fields.setdefault("entrypoint", None)
+
+    payload_raw = fields.get("payload", "")
+    payload_names = [entry.strip() for entry in payload_raw.split(",") if entry.strip()]
+    for name in payload_names:
+        if "/" in name or name in (".", ".."):
+            raise CajError(f"payload entry is not a safe basename: {name!r}")
+    duplicates = sorted({n for n in payload_names if payload_names.count(n) > 1})
+    if duplicates:
+        # A duplicate basename (e.g. "payload: alice.pub,alice.pub") would
+        # otherwise emit two identical payload/<name> tar members -- a wasteful,
+        # malformed artifact from a plain operator typo. Reject it up front with
+        # a clear message rather than silently doubling the member.
+        raise CajError(
+            f"duplicate payload basename(s): {', '.join(duplicates)} -- each "
+            f"staged file may be listed in 'payload' only once"
+        )
+    fields["payload"] = payload_names
+
+    if fields["operation"] == "run-script":
+        if not fields["entrypoint"] or fields["entrypoint"] not in payload_names:
+            raise CajError(
+                "operation=run-script requires 'entrypoint' to name one of "
+                "the 'payload' files"
+            )
+
+    return fields
+
+
+def _resolve_payload_sources(spec_path: str, payload_names: list) -> list:
+    """Resolve each staged payload basename to an actual file on disk,
+    relative to the spec file's OWN directory (see module docstring)."""
+    spec_dir = os.path.dirname(os.path.abspath(spec_path))
+    sources = []
+    for name in payload_names:
+        src = os.path.join(spec_dir, name)
+        if not os.path.isfile(src):
+            raise CajError(f"payload file not found (expected staged next to spec): {src}")
+        sources.append(src)
+    return sources
+
+
+# --- seq bookkeeping (ca-state/last-seq, ca-state/last-built-seq) ---
+
+
+def _state_dir() -> str:
+    override = os.environ.get("CAJ_STATE_DIR")
+    if override:
+        return override
+    return os.path.join(REPO_ROOT, "ca-state")
+
+
+def _read_int(path: str, default: int) -> int:
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except FileNotFoundError:
+        return default
+
+
+def _write_int_atomic(path: str, value: int) -> None:
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as f:
+        f.write(str(value))
+    os.replace(tmp_path, path)
+
+
+def _next_seq(state_dir: str) -> int:
+    """seq = max(repo_last_seq, highest_built_unconfirmed) + 1 (module
+    docstring's "seq bookkeeping" section)."""
+    repo_last_seq = _read_int(os.path.join(state_dir, _LAST_SEQ_NAME), default=0)
+    last_built = _read_int(os.path.join(state_dir, _LAST_BUILT_SEQ_NAME), default=0)
+    return max(repo_last_seq, last_built) + 1
+
+
+def _record_built_seq(state_dir: str, seq: int) -> None:
+    _write_int_atomic(os.path.join(state_dir, _LAST_BUILT_SEQ_NAME), seq)
+
+
+def _with_lock(state_dir: str, fn):
+    """Single-writer: run `fn()` (no args) under an exclusive flock on
+    `<state_dir>/.caj.lock`, creating state_dir first if needed."""
+    os.makedirs(state_dir, exist_ok=True)
+    lock_path = os.path.join(state_dir, _LOCK_NAME)
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        return fn()
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+# --- job_id (fresh uuid4, or --retry's preserved one) ---
+
+
+def _resolve_job_id(retry_job_id: str) -> str:
+    if retry_job_id is None:
+        return str(uuid.uuid4())
+    try:
+        parsed = uuid.UUID(retry_job_id)
+    except (ValueError, AttributeError, TypeError):
+        raise CajError(f"--retry job_id is not a valid uuid: {retry_job_id!r}")
+    if parsed.version != 4:
+        raise CajError(f"--retry job_id is not a uuid4: {retry_job_id!r}")
+    return retry_job_id
+
+
+# --- manifest + job.tar assembly ---
+
+
+def _build_manifest(spec: dict, box: str, seq: int, job_id: str) -> dict:
+    return {
+        "schema_version": 1,
+        "bundle_id": spec.get("name") or job_id,
+        "box": box,
+        "seq": seq,
+        "jobs": [
+            {
+                "job_id": job_id,
+                "operation": spec["operation"],
+                "args": spec["args"],
+                "payload": spec["payload"],
+                "entrypoint": spec["entrypoint"],
+            }
+        ],
+    }
+
+
+def _self_check_manifest(raw: bytes, payload_names: list) -> None:
+    """Refuse to sign a manifest the box's own strict parser would
+    reject -- fail fast, on the Mac, with the SAME reason string the box
+    would eventually report, rather than producing a bundle that silently
+    fails much later at box-verification time."""
+    try:
+        causb_manifest.parse(raw, payload_names=set(payload_names))
+    except causb_manifest.ManifestError as exc:
+        raise CajError(
+            f"internal error: the manifest caj just built would be rejected "
+            f"by causb.manifest.parse() ({exc.reason}); refusing to sign"
+        )
+
+
+def _build_job_tar(build_dir: str, raw_manifest: bytes, payload_names: list,
+                    payload_sources: list) -> str:
+    """Assemble manifest.json + payload/<basename> under `build_dir` and tar
+    them into `build_dir/job.tar` with CLEAN member names only: exactly
+    "manifest.json" and "payload/<basename>" per file, via an explicit
+    `arcname=` -- never `tar.add(directory)` (module docstring)."""
+    manifest_path = os.path.join(build_dir, "manifest.json")
+    with open(manifest_path, "wb") as f:
+        f.write(raw_manifest)
+
+    payload_dir = os.path.join(build_dir, "payload")
+    os.makedirs(payload_dir, exist_ok=True)
+    for name, src in zip(payload_names, payload_sources):
+        shutil.copyfile(src, os.path.join(payload_dir, name))
+
+    tar_path = os.path.join(build_dir, "job.tar")
+    with tarfile.open(tar_path, "w") as tar:
+        tar.add(manifest_path, arcname="manifest.json")
+        for name in payload_names:
+            tar.add(os.path.join(payload_dir, name), arcname=f"payload/{name}")
+    return tar_path
+
+
+def _sign(key_path: str, tar_path: str) -> str:
+    """`ssh-keygen -Y sign -f <key_path> -n <causb.config.NS> <tar_path>` ->
+    `<tar_path>.sig`, in the same namespace causb.verify checks against."""
+    result = subprocess.run(
+        ["ssh-keygen", "-Y", "sign", "-f", key_path, "-n", config.NS, tar_path],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        raise CajError(
+            f"ssh-keygen -Y sign failed (exit {result.returncode}): "
+            f"{result.stderr.decode(errors='replace').strip()}"
+        )
+    return tar_path + ".sig"
+
+
+def _sign_breakglass(breakglass_key_path: str, tar_path: str) -> str:
+    """Produce the break-glass co-signature: a SECOND detached
+    signature over the SAME job.tar bytes, via the exact same `_sign()`
+    invocation (same namespace, same ssh-keygen flags) as the primary sig --
+    just a different key, ending up named `<tar_path>.bg.sig` instead of
+    `<tar_path>.sig`.
+
+    `ssh-keygen -Y sign` always names its output `<input file>.sig` (no flag
+    to override this), so signing `tar_path` itself a second time would
+    overwrite the just-written primary `<tar_path>.sig`. Instead, this signs
+    a byte-identical COPY of tar_path named `<tar_path>.bg` -- ssh-keygen's
+    same fixed naming convention then lands the output at exactly
+    `<tar_path>.bg.sig`, with no risk of ever clobbering the primary sig (a
+    completely different input filename, a completely separate ssh-keygen
+    invocation). The SSHSIG format signs only the namespace + a hash of the
+    input BYTES, never the input's filename, so this signature verifies
+    identically against the real job.tar's bytes (confirmed against
+    causb.verify.verify(), which feeds tar_path's bytes on stdin and never
+    looks at any filename baked into the signature)."""
+    bg_input_path = tar_path + ".bg"
+    shutil.copyfile(tar_path, bg_input_path)
+    return _sign(breakglass_key_path, bg_input_path)
+
+
+# --- atomic delivery onto the stick's inbox/ ---
+
+
+def _place_atomic(src_path: str, final_path: str) -> None:
+    """Copy `src_path` to a `.tmp` sibling of `final_path`, flush+fsync it,
+    then `os.replace()` it into `final_path` -- an atomic rename within the
+    one inbox directory/filesystem. The final name is only ever created by
+    renaming a fully-written temp, so a crash or USB-yank can never leave a
+    truncated or partially-written final file at that name."""
+    tmp_path = final_path + ".tmp"
+    with open(src_path, "rb") as src, open(tmp_path, "wb") as dst:
+        shutil.copyfileobj(src, dst)
+        dst.flush()
+        os.fsync(dst.fileno())
+    os.replace(tmp_path, final_path)
+
+
+def _deliver_atomic(tar_path: str, sig_path: str, inbox_dir: str, bg_sig_path: str = None) -> None:
+    """Deliver job.tar, then (if given) job.tar.bg.sig, then job.tar.sig into
+    `inbox_dir`, each via `_place_atomic` (tmp -> rename), with the PRIMARY
+    SIGNATURE written LAST always (extended for the break-glass
+    co-sign). If a crash interrupts delivery, the worst observable state on
+    the stick is a job.tar (+ maybe a job.tar.bg.sig) with no (or a stale)
+    job.tar.sig -- which the box rejects fail-closed -- never a signature
+    paired with a truncated/absent tar, and never a primary sig landing
+    before a co-signature that was supposed to accompany it.
+
+    `bg_sig_path` defaults to None: when absent (no --breakglass), delivery
+    is exactly the original two-file job.tar-then-job.tar.sig sequence --
+    unchanged."""
+    _place_atomic(tar_path, os.path.join(inbox_dir, "job.tar"))
+    if bg_sig_path is not None:
+        _place_atomic(bg_sig_path, os.path.join(inbox_dir, "job.tar.bg.sig"))
+    _place_atomic(sig_path, os.path.join(inbox_dir, "job.tar.sig"))
+
+
+# --- the `build` subcommand ---
+
+
+def build_command(args: argparse.Namespace) -> None:
+    spec_path = os.path.abspath(os.path.expanduser(args.spec))
+    stick = os.path.abspath(os.path.expanduser(args.stick))
+    key_path = os.path.abspath(os.path.expanduser(args.key))
+    breakglass_key_path = None
+    if args.breakglass:
+        breakglass_key_path = os.path.abspath(os.path.expanduser(args.breakglass))
+
+    if not os.path.isdir(stick):
+        raise CajError(f"--stick path does not exist or is not a directory: {stick}")
+    if not os.path.isfile(key_path):
+        raise CajError(f"signing key not found: {key_path}")
+    if breakglass_key_path is not None and not os.path.isfile(breakglass_key_path):
+        raise CajError(f"break-glass signing key not found: {breakglass_key_path}")
+
+    spec = _parse_spec(spec_path)
+    payload_sources = _resolve_payload_sources(spec_path, spec["payload"])
+    job_id = _resolve_job_id(args.retry)
+    state_dir = _state_dir()
+
+    def _do_build():
+        seq = _next_seq(state_dir)
+        # Reserve the seq BEFORE building/signing/delivering:
+        # persist last-built-seq up front, under the flock, so a crash or
+        # failure anywhere below can at worst WASTE this seq (the box only
+        # requires a monotonically increasing seq -- gaps are fine), and no two
+        # DELIVERED jobs can ever bear the same seq. Recording it only AFTER
+        # delivery (the earlier order) left a crash window in which the next
+        # build reused the seq and stranded the delivered job as stale_seq.
+        _record_built_seq(state_dir, seq)
+
+        manifest = _build_manifest(spec, spec["box"], seq, job_id)
+        raw = json.dumps(manifest, indent=2, sort_keys=True).encode()
+        _self_check_manifest(raw, spec["payload"])
+
+        inbox_dir = os.path.join(stick, "inbox")
+        build_dir = tempfile.mkdtemp(prefix="caj-build-")
+        try:
+            tar_path = _build_job_tar(build_dir, raw, spec["payload"], payload_sources)
+            sig_path = _sign(key_path, tar_path)
+            bg_sig_path = None
+            if breakglass_key_path is not None:
+                bg_sig_path = _sign_breakglass(breakglass_key_path, tar_path)
+            os.makedirs(inbox_dir, exist_ok=True)
+            _deliver_atomic(tar_path, sig_path, inbox_dir, bg_sig_path=bg_sig_path)
+        finally:
+            shutil.rmtree(build_dir, ignore_errors=True)
+
+        print(f"caj: built job {job_id} (seq={seq}) -> {inbox_dir}")
+
+    _with_lock(state_dir, _do_build)
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="caj")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    build_parser = subparsers.add_parser(
+        "build", help="Build and sign a job bundle onto a USB stick's inbox/."
+    )
+    build_parser.add_argument("--spec", required=True, help="Path to the job spec file.")
+    build_parser.add_argument("--stick", required=True, help="Path to the mounted USB stick.")
+    build_parser.add_argument(
+        "--retry", metavar="JOB_ID", default=None,
+        help="Reuse this exact job_id (still advances seq) instead of minting a new one.",
+    )
+    build_parser.add_argument(
+        "--key", default=os.path.expanduser("~/.ssh/id_ed25519"),
+        help="ssh-keygen -Y sign signing key (default: ~/.ssh/id_ed25519).",
+    )
+    build_parser.add_argument(
+        "--breakglass", metavar="BREAKGLASS_KEY", default=None,
+        help="Also co-sign job.tar with this break-glass key -> "
+             "inbox/job.tar.bg.sig (co-signature for a privileged/ "
+             "breakglass-touching job). Omit for an ordinary job: no "
+             "job.tar.bg.sig is produced.",
+    )
+
+    parsed = parser.parse_args(argv)
+
+    try:
+        if parsed.command == "build":
+            build_command(parsed)
+    except CajError as exc:
+        print(f"caj: error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,531 @@
+#!/usr/bin/env python3
+"""box/handlers/sign-hosts -- the "sign-hosts" vetted handler. This is
+the handler that makes the box
+useful as a CA day to day: for each mesh host pubkey the operator submits on
+the stick, it assigns a STABLE overlay IP (by name, via `causb.registry`),
+signs a v1 host cert against the box's own `ca.key`/`ca.crt` (through
+`causb.nebulacli.sign`), records the allocation (both in `registry.json` and
+as a flat per-job record `results/<job_id>/` can later reconcile from), and
+returns the signed cert on the stick -- `ca.key` never leaves. A standalone,
+extensionless script (like `box/handlers/ca-bootstrap`/`status` before it),
+installed to `config.HANDLERS_DIR` (or run straight out of a repo checkout's
+`box/handlers/`) and invoked by `causb.dispatch` as `sign-hosts <job.json>
+<payload_dir> <out_dir>` -- the same uniform vetted-handler argv contract
+every other handler gets. `job.json` here is `causb.manifest.parse()`'s
+single `jobs[0]` dict (job_id/operation/args/payload), NOT the full manifest
+wrapper -- see `causb.dispatch._write_job_json`, exactly like
+`box/handlers/ca-bootstrap`'s own module docstring documents.
+
+**Not-bootstrapped guard, checked FIRST.** Mirrors `ca-bootstrap`'s own
+"check identity before touching anything else" ordering: `run()`'s very
+first act is `os.path.isfile` on both `ca_dir/ca.key` and `ca_dir/ca.crt`,
+before the manifest's `args` are even looked at. There is nothing to sign
+against on a box that has not yet minted its CA, so nothing else here (host
+list resolution, overlay/duration validation, the registry) is worth doing
+first.
+
+**Reserve-then-commit: the registry is built up ENTIRELY in memory across
+every host in the job, and `registry.save()` is called EXACTLY ONCE, at the
+very end, only after every host in the job has signed successfully.** This
+is the load-bearing safety property the spec calls "a per-host failure
+should abort the whole job cleanly": if host 2 of 3 raises `NebulaError`,
+host 1's in-memory `allocate()`/`record()` updates are simply discarded when
+`run()` returns early -- the on-disk `registry_path` is never touched, so a
+harness retry of the WHOLE job (a fresh job_id, same manifest content) sees
+exactly the pre-attempt registry and reallocates deterministically from
+there. `causb.registry.allocate()`'s own contract (an existing name's IP is
+returned unconditionally, never re-derived) is what makes that retry land on
+the same addresses host 1 would have gotten had the job succeeded outright.
+The signed `<name>.crt`/`<name>.png`/`alloc-<name>.json` files for hosts
+ALREADY processed before the failure are deliberately NOT rolled back from
+`out_dir` -- `out_dir` is a per-job staging tree the orchestrator collects
+and commits/delivers regardless of the handler's final exit code (see
+`box/bin/ca-usb-run`'s `_collect_outputs`, "still carrying whatever the
+run did produce"), so a failed job's partial artifacts are preserved for
+forensic/audit purposes the same way any other failed job's partial output
+would be -- only `registry.json` (the box's OWN durable, authoritative-cache
+state) has a "nothing partial, ever" requirement, and that is what this
+module actually protects.
+
+**The seq this module reads (threaded by the orchestrator, and
+REQUIRED).** The spec calls for `registry.allocation_record(...,
+seq=<manifest seq>)` -- the manifest's own top-level, harness-enforced
+monotonic counter, used purely as `causb.registry.reconcile()`'s
+deterministic replay-ordering key (never for anything security-relevant).
+The manifest schema keeps `seq` at the TOP level, not inside a job, so a
+vetted handler only sees it if the orchestrator threads it in.
+`box/bin/ca-usb-run` does exactly that:
+immediately before `dispatch.run(...)` it stamps `job["seq"] = seq`, and
+`causb.dispatch._write_job_json` serializes the WHOLE job dict into this
+handler's `job.json` -- so `job["seq"]` arrives here with no changes to
+`dispatch` itself. This module therefore reads `job.get("seq")` and REQUIRES
+it: a missing seq (or a non-int / bool / negative one) is `bad_manifest`, NOT
+a silent default -- an absent seq now signals a real wiring/manifest bug
+(the orchestrator failed to stamp it) rather than a tolerated condition, so
+failing closed is correct. NO `time`/`random`/`datetime.now()` is used here
+for this or anything else determinism-sensitive, matching `causb.registry`'s
+own hard requirement (the seq is always caller-supplied, never synthesized).
+
+**The within-job seq tiebreak scheme.** A single job can sign MULTIPLE
+hosts (`args.hosts` is a list) sharing that one job seq, so each host needs
+its OWN distinct `allocation_record` seq for `reconcile()`'s sort order to
+stay total. Hosts are processed in a DETERMINISTIC order (sorted by `name`
+-- never the manifest's or a directory listing's own incidental order), and
+`seq = job_seq * 1000 + index` where `index` is the 0-based position in
+that sorted order. 1000 is comfortably larger than `config.CAPS
+["payload_files"]` (16) -- the hard upper bound on how many hosts one job
+could possibly name (each `pub` must resolve to a real payload file, and a
+job's payload is capped at 16 files) -- so no single job's within-job
+indices can ever collide with the next job_seq's own base value.
+
+**Overlay authority: the REGISTRY owns the overlay, not the manifest.**
+`registry.json`'s `overlay_cidr` was fixed at `ca-bootstrap`
+time and is the single authoritative /16 this box allocates hosts into. This
+handler therefore DERIVES the overlay it hands to `registry.allocate()` from
+the loaded registry, never from a manifest default. A manifest MAY still
+restate `args.overlay`, but only to AGREE: a supplied overlay is checked for
+its own `prefixlen == 16` first (so a `/32` degenerate single-address "pool"
+or any other non-/16 is still the more-specific `bad_prefix`, preserving that
+contract) and then must equal the registry's network EXACTLY -- a mismatch is
+`bad_manifest`, because a job must never silently allocate hosts into a
+different /16 than the CA was bootstrapped for. As a defensive backstop the
+registry's OWN overlay is re-checked for `prefixlen == 16` too (a box somehow
+bootstrapped into a non-/16 fails closed as `bad_prefix`). Separately, and
+unconditionally, every signed cert's `-networks` value is built as the
+literal `f"{ip}/16"` -- never derived from whatever prefix a string happened
+to parse to -- so the cert's embedded network width can never drift from the
+box's one supported mesh shape.
+
+**Reserved host names.** A host `name` of `ca` or `registry` (compared
+case-insensitively) is rejected `bad_manifest`: `ca` -> `out_dir/ca.crt`
+would collide with the conventional public-CA-cert filename `ca-bootstrap`
+delivers, and `registry` shares the stem of the `registry.json` topology
+file this handler writes into `out_dir`. See `_RESERVED_NAMES`.
+
+**Duration must be non-empty and genuinely non-zero.** An unbounded
+(never-expiring) host cert is a policy violation this handler refuses to
+produce by omission: `args.duration` (default `config.HOST_CERT_DURATION`)
+must be a control-character-free, non-empty string containing at least one
+non-zero numeric component (rejects `""`, `"0"`, `"0h"`, `"0h0m0s"`, a
+leading `-` sign, and any non-string) -- anything else is `bad_manifest`
+before `nebula_sign` is ever called. This does not attempt to fully
+re-implement Go's `time.ParseDuration` grammar; nebula-cert itself is the
+final arbiter of whether a syntactically-plausible-but-weird duration
+string is acceptable (a genuinely malformed one surfaces as
+`NebulaError("nebula_failed")`, still fail-closed).
+
+**Backdating `notBefore`: verified LIVE against the box, v1.10.3, NOT
+supported -- and not pluggable through this handler's interface
+even if it were.** `nebula-cert sign -h` on the real box lists exactly:
+`-ca-crt -ca-key -duration -groups -in-pub -ip -name -networks -out-crt
+-out-key -out-qr -subnets -unsafe-networks -version` -- no `-notBefore` or
+backdate flag of any kind. A live probe (mint a throwaway CA + host keypair,
+sign, `print -json`) confirms the signed cert's `notBefore` is exactly the
+real wall-clock signing instant. Separately, and independently of what the
+CLI itself supports, `causb.nebulacli.sign()` has no backdate/`not_before`
+parameter either, and extending it
+is out of scope here -- so this module could not wire
+one through even if v1.10.3 gained one tomorrow. `config.BACKDATE` ("5m")
+is defined (per the spec) purely as documentation of the box's
+actual policy: the 5-minute skew is tolerated MESH-side (a peer's own clock
+tolerance during nebula's handshake), never faked by backdating the cert
+itself.
+
+**`ca.key` (and `ca.crt`) NEVER copied to `out_dir`.** The only files this
+module ever writes under `out_dir` are, by explicit construction (never a
+directory sweep or `copytree`): each signed host's `<name>.crt` (written
+directly by `nebula_sign`'s own `out_crt=`), that host's `<name>.png` if
+`mobile` was requested, one `alloc-<name>.json` allocation record per host,
+and (once, after every host succeeds) the just-saved `registry.json`.
+`ca_dir` itself is never listed, globbed, or copied wholesale -- mirrors
+`ca-bootstrap`'s own strict-allowlist copy discipline.
+
+**Exit codes / reason vocabulary.** `EXIT_OK` (0), `EXIT_FAULT` (1 --
+CLI-invocation misuse, unreachable in production since `causb.dispatch`
+always supplies the fixed 4-element argv), `EXIT_BAD_MANIFEST` (2),
+`EXIT_NOT_BOOTSTRAPPED` (3), `EXIT_NAME_CONFLICT` (4), `EXIT_POOL_EXHAUSTED`
+(5), `EXIT_BAD_PREFIX` (6), `EXIT_NEBULA_FAILED` (7), `EXIT_WRITE_FAILED`
+(8, also covers a corrupt/unparseable on-disk `registry.json` --
+`RegistryError("bad_registry")` has no dedicated slot in the spec's fixed
+reason vocabulary, so it folds into this bucket, the same way
+`ca-usb-run`'s own collect/commit layer folds assorted sub-reasons into
+`handler_failed` where the fixed enum has no more specific string). Only
+the harness's own "any handler exit != 0 maps to handler_failed at the
+dispatch layer" contract is load-bearing; the specific small distinct
+integers below exist for anyone reading a log, mirroring `ca-bootstrap`'s
+identical stance on its own exit codes.
+"""
+
+import base64
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import shutil
+import sys
+
+# APPEND (not insert(0)): see box/handlers/ca-bootstrap's identical comment
+# for the full reasoning -- an explicit PYTHONPATH (e.g. this repo's own
+# unit tests, or the on-box test runner) must be honoured rather than
+# shadowed by a possibly-stale installed copy.
+sys.path.append("/usr/local/lib")
+
+from causb import config, nebulacli, registry  # noqa: E402  (see sys.path.append above)
+
+EXIT_OK = 0
+EXIT_FAULT = 1  # CLI-invocation misuse (wrong argc) -- mirrors ca-bootstrap's
+                # EXIT_FAULT; should never happen in production.
+EXIT_BAD_MANIFEST = 2
+EXIT_NOT_BOOTSTRAPPED = 3
+EXIT_NAME_CONFLICT = 4
+EXIT_POOL_EXHAUSTED = 5
+EXIT_BAD_PREFIX = 6
+EXIT_NEBULA_FAILED = 7
+EXIT_WRITE_FAILED = 8
+
+_REASON_BY_EXIT = {
+    EXIT_FAULT: "fault",
+    EXIT_BAD_MANIFEST: "bad_manifest",
+    EXIT_NOT_BOOTSTRAPPED: "not_bootstrapped",
+    EXIT_NAME_CONFLICT: "name_conflict",
+    EXIT_POOL_EXHAUSTED: "pool_exhausted",
+    EXIT_BAD_PREFIX: "bad_prefix",
+    EXIT_NEBULA_FAILED: "nebula_failed",
+    EXIT_WRITE_FAILED: "write_failed",
+}
+
+# The box's one supported overlay shape (module docstring). Any manifest
+# `args.overlay` whose prefix isn't exactly this is `bad_prefix`; every
+# signed cert's own `-networks` value is unconditionally built at this width.
+_FORCED_PREFIXLEN = 16
+
+# Within-job seq tiebreak multiplier (module docstring): comfortably larger
+# than config.CAPS["payload_files"] (16), so per-host indices from one job
+# can never collide with the next job_seq's own base value.
+_SEQ_TIEBREAK_MULTIPLIER = 1000
+
+_PUB_SUFFIX = ".pub"
+
+# Host names this handler refuses (bad_manifest), because the file each would
+# produce under out_dir collides with a reserved/conventional artifact name:
+# a host named "ca" -> out_dir/ca.crt, the exact filename ca-bootstrap
+# delivers the PUBLIC CA cert under (a host cert masquerading as the CA cert
+# in a results dir is a real confusion/forgery-surface hazard); "registry" ->
+# out_dir/registry.{crt,png} shares the stem of the registry.json topology
+# file this handler also writes there. Compared CASE-INSENSITIVELY: the vfat
+# stick these artifacts are ultimately delivered onto (caj-recv) is
+# case-insensitive, so "CA.crt" and "ca.crt" collide there even though the
+# tmpfs out_dir the handler writes into is case-sensitive. Only an EXACT
+# (case-folded) match is reserved -- a name that merely CONTAINS "ca"/
+# "registry" (e.g. "cache", "registry-mirror") is fine.
+_RESERVED_NAMES = frozenset({"ca", "registry"})
+
+
+def _is_clean_str(value):
+    """True if `value` is a string containing no control character (NUL,
+    C0 0x00-0x1f, or DEL 0x7f) -- verbatim copy of ca-bootstrap's own helper
+    (this project's established per-module self-contained-duplication
+    convention; see causb/registry.py's docstring for the rationale)."""
+    if not isinstance(value, str):
+        return False
+    return not any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in value)
+
+
+def _is_safe_basename(value):
+    """True if `value` is a non-empty, control-character-free string safe
+    to use as a SINGLE path component: no "/", not "."/"..". Mirrors
+    `causb.dispatch._safe_component`/`causb.manifest.parse`'s identical
+    basename checks -- this module's own local copy, per this project's
+    established convention. Applied to every `pub`/`name` this handler ever
+    joins into a `payload_dir`/`out_dir` path, so a manifest cannot escape
+    either directory via a crafted "../" component."""
+    if not _is_clean_str(value) or not value:
+        return False
+    if "/" in value or value in (".", ".."):
+        return False
+    return True
+
+
+def _is_valid_duration(value):
+    """True if `value` is a non-empty, control-character-free duration
+    string with at least one genuinely non-zero numeric component, and no
+    leading `-` (module docstring: reject unbounded-by-omission AND
+    negative durations; this is deliberately not a full Go time.Duration
+    parser -- nebula-cert itself is the final arbiter of syntactic
+    validity, this is just the "must actually expire, and not have already
+    expired before it started" policy gate)."""
+    if not _is_clean_str(value) or not value.strip():
+        return False
+    if "-" in value:
+        return False
+    numbers = re.findall(r"\d+(?:\.\d+)?", value)
+    if not numbers:
+        return False
+    return any(float(n) != 0 for n in numbers)
+
+
+def _resolve_hosts(args, payload_dir):
+    """Build the job's deterministic, sorted-by-name host list (module
+    docstring). Returns `(hosts, None)` on success -- each host a dict
+    `{"pub", "name", "groups", "mobile"}` (groups always a list, mobile
+    always a bool) -- or `(None, EXIT_BAD_MANIFEST)` (or, only for an
+    unreadable `payload_dir` itself, `(None, EXIT_WRITE_FAILED)`) otherwise.
+    Never raises; never touches the registry or ca_dir.
+
+    `args.hosts` (a list of `{pub, name, groups?, mobile?}`), if present,
+    is used as-is (each entry independently validated). If ABSENT entirely,
+    every `payload_dir/*.pub` file is used instead, named by its filename
+    stem, with no groups and no QR (fallback). Either way: every `pub`
+    must be a safe basename that actually exists as a file in
+    `payload_dir` (a manifest's claim that doesn't match reality is
+    `bad_manifest`, exactly like `causb.manifest.parse`'s own payload[]
+    vs-disk symmetry check), every `name` must be a safe basename too (it
+    becomes part of an `out_dir` filename), no two hosts may resolve to the
+    same `name`, and the resolved list must be non-empty (a sign-hosts job
+    that signs nothing has no legitimate purpose and is far more likely to
+    be a manifest/tooling bug than an intentional no-op).
+    """
+    raw_hosts = args.get("hosts")
+
+    if raw_hosts is None:
+        try:
+            entries = os.listdir(payload_dir)
+        except OSError:
+            return None, EXIT_WRITE_FAILED
+        hosts = []
+        for fname in entries:
+            if not fname.endswith(_PUB_SUFFIX):
+                continue
+            stem = fname[: -len(_PUB_SUFFIX)]
+            if not _is_safe_basename(fname) or not _is_safe_basename(stem):
+                return None, EXIT_BAD_MANIFEST
+            hosts.append({"pub": fname, "name": stem, "groups": [], "mobile": False})
+    else:
+        if not isinstance(raw_hosts, list):
+            return None, EXIT_BAD_MANIFEST
+        hosts = []
+        for entry in raw_hosts:
+            if not isinstance(entry, dict):
+                return None, EXIT_BAD_MANIFEST
+            pub = entry.get("pub")
+            name = entry.get("name")
+            if not _is_safe_basename(pub) or not _is_safe_basename(name):
+                return None, EXIT_BAD_MANIFEST
+            groups = entry.get("groups", [])
+            if not isinstance(groups, list) or not all(
+                isinstance(g, str) and _is_clean_str(g) for g in groups
+            ):
+                return None, EXIT_BAD_MANIFEST
+            mobile = entry.get("mobile", False)
+            if not isinstance(mobile, bool):
+                return None, EXIT_BAD_MANIFEST
+            hosts.append({"pub": pub, "name": name, "groups": groups, "mobile": mobile})
+
+    if not hosts:
+        return None, EXIT_BAD_MANIFEST
+
+    for h in hosts:
+        if h["name"].lower() in _RESERVED_NAMES:
+            return None, EXIT_BAD_MANIFEST
+
+    names = [h["name"] for h in hosts]
+    if len(set(names)) != len(names):
+        return None, EXIT_BAD_MANIFEST
+
+    for h in hosts:
+        if not os.path.isfile(os.path.join(payload_dir, h["pub"])):
+            return None, EXIT_BAD_MANIFEST
+
+    hosts.sort(key=lambda h: h["name"])
+    return hosts, None
+
+
+def run(job, payload_dir, out_dir, *, ca_dir=config.CA_DIR,
+        registry_path=config.REGISTRY, nebula_sign=nebulacli.sign,
+        nebula_print=nebulacli.print_json):
+    """Handler entrypoint body (behavior steps 1-7). `ca_dir`/
+    `registry_path`/`nebula_sign`/`nebula_print` are DI seams (mirrors
+    `ca-bootstrap`'s identical convention): production calls (the
+    `__main__` shim below) use the real `config.CA_DIR`/`config.REGISTRY`/
+    `causb.nebulacli.sign`/`causb.nebulacli.print_json`; tests point all
+    four at tmpdirs + fake recorders.
+
+    Returns one of the `EXIT_*` codes above; never raises for any
+    foreseeable failure (`NebulaError`, `RegistryError`, `OSError`) -- see
+    module docstring.
+    """
+    ca_key_path = os.path.join(ca_dir, "ca.key")
+    ca_crt_path = os.path.join(ca_dir, "ca.crt")
+
+    # 1. Not-bootstrapped guard -- FIRST, before args are even looked at
+    # (module docstring).
+    if not (os.path.isfile(ca_key_path) and os.path.isfile(ca_crt_path)):
+        return EXIT_NOT_BOOTSTRAPPED
+
+    # 2. Manifest args -- job.json is the single job dict (job_id/operation/
+    # args/payload/seq), NOT the full manifest wrapper. args itself is
+    # entirely unvalidated upstream (causb.manifest.parse() never inspects
+    # it) -- a non-dict args is treated as empty (every field then falls back
+    # to its config-sourced default) rather than crashing, mirroring
+    # ca-bootstrap's identical stance.
+    args = job.get("args")
+    if not isinstance(args, dict):
+        args = {}
+
+    # seq is REQUIRED: box/bin/ca-usb-run stamps the
+    # manifest's own monotonic seq onto the job dict immediately before
+    # dispatch, and dispatch._write_job_json serializes the whole job dict
+    # into the handler's job.json -- so a MISSING seq is a wiring/manifest
+    # bug, rejected here rather than papered over with a silent default (the
+    # old, now-removed `job.get("seq", 0)` fallback). bool is an int subclass,
+    # so it is excluded explicitly; a negative seq is rejected too.
+    job_seq = job.get("seq")
+    if job_seq is None or isinstance(job_seq, bool) or not isinstance(job_seq, int) or job_seq < 0:
+        return EXIT_BAD_MANIFEST
+
+    duration = args.get("duration", config.HOST_CERT_DURATION)
+    if not _is_valid_duration(duration):
+        return EXIT_BAD_MANIFEST
+
+    # 3. Load the registry ONCE, up front -- its `overlay_cidr` (set at
+    # ca-bootstrap) is the AUTHORITATIVE /16 this box allocates hosts into
+    # (the registry, not the manifest default, owns the
+    # overlay). A corrupt/unparseable on-disk registry.json ("bad_registry")
+    # folds into EXIT_WRITE_FAILED -- see module docstring's exit-code section.
+    try:
+        reg = registry.load(registry_path)
+    except registry.RegistryError:
+        return EXIT_WRITE_FAILED
+
+    overlay = reg["overlay_cidr"]
+    if not _is_clean_str(overlay):
+        return EXIT_WRITE_FAILED  # corrupt registry: overlay_cidr not a clean str
+    try:
+        overlay_network = ipaddress.ip_network(overlay, strict=False)
+    except ValueError:
+        return EXIT_WRITE_FAILED  # corrupt registry: overlay_cidr unparseable
+
+    # A manifest MAY restate `args.overlay`, but ONLY to AGREE with the
+    # registry's authoritative overlay -- a job must never silently allocate
+    # hosts into a different /16 than the CA was bootstrapped for. A supplied
+    # overlay is checked for its OWN prefix width first (so a /32 or any other
+    # non-/16 is still the more-specific bad_prefix, preserving that contract)
+    # and then must equal the registry's network exactly, else bad_manifest.
+    manifest_overlay = args.get("overlay")
+    if manifest_overlay is not None:
+        if not _is_clean_str(manifest_overlay):
+            return EXIT_BAD_MANIFEST
+        try:
+            manifest_network = ipaddress.ip_network(manifest_overlay, strict=False)
+        except ValueError:
+            return EXIT_BAD_MANIFEST
+        if manifest_network.prefixlen != _FORCED_PREFIXLEN:
+            return EXIT_BAD_PREFIX
+        if manifest_network != overlay_network:
+            return EXIT_BAD_MANIFEST
+
+    # The overlay actually used (the registry's) must itself be a /16 -- a
+    # defensive guard against a box somehow bootstrapped into a non-/16.
+    if overlay_network.prefixlen != _FORCED_PREFIXLEN:
+        return EXIT_BAD_PREFIX
+
+    hosts, err = _resolve_hosts(args, payload_dir)
+    if err is not None:
+        return err
+
+    # 4. Reserve-then-commit: every host is allocated/signed/recorded
+    # against the SAME in-memory `reg`, which is only ever persisted (via
+    # registry.save(), exactly once) after the ENTIRE loop below completes
+    # without error. See module docstring's "Reserve-then-commit" section
+    # for why this is the load-bearing safety property here.
+    try:
+        for index, host in enumerate(hosts):
+            name = host["name"]
+            pub_path = os.path.join(payload_dir, host["pub"])
+            with open(pub_path, "rb") as f:
+                pubkey_bytes = f.read()
+
+            ip, reg = registry.allocate(reg, name, pubkey_bytes, overlay_cidr=overlay)
+            networks = f"{ip}/{_FORCED_PREFIXLEN}"
+
+            out_crt = os.path.join(out_dir, f"{name}.crt")
+            out_qr = os.path.join(out_dir, f"{name}.png") if host["mobile"] else None
+
+            nebula_sign(
+                ca_crt_path, ca_key_path, pub_path, name, networks, duration,
+                out_crt=out_crt, groups=host["groups"], out_qr=out_qr,
+            )
+
+            details = nebula_print(out_crt)
+            fingerprint = details.get("fingerprint")
+            not_after = (details.get("details") or {}).get("notAfter")
+
+            reg = registry.record(reg, name, ip, pubkey_bytes, fingerprint, not_after, host["groups"])
+
+            alloc_seq = job_seq * _SEQ_TIEBREAK_MULTIPLIER + index
+            rec = registry.allocation_record(
+                name, ip, hashlib.sha256(pubkey_bytes).hexdigest(),
+                fingerprint, not_after, host["groups"], seq=alloc_seq,
+                pubkey=base64.b64encode(pubkey_bytes).decode("ascii"),
+            )
+            with open(os.path.join(out_dir, f"alloc-{name}.json"), "w") as f:
+                json.dump(rec, f, indent=2, sort_keys=True)
+
+        # 5. Every host succeeded -- commit the registry ONCE, atomically
+        # (registry.save() itself is tmp-write + fsync + rename + fsync-dir;
+        # see causb/registry.py), then copy it (topology; caj-recv places
+        # it) to out_dir from the just-saved final path.
+        registry.save(reg, registry_path)
+        shutil.copyfile(registry_path, os.path.join(out_dir, "registry.json"))
+    except nebulacli.NebulaError:
+        return EXIT_NEBULA_FAILED
+    except registry.RegistryError as exc:
+        if exc.reason == "name_conflict":
+            return EXIT_NAME_CONFLICT
+        if exc.reason == "pool_exhausted":
+            return EXIT_POOL_EXHAUSTED
+        return EXIT_WRITE_FAILED  # bad_registry -- see module docstring
+    except OSError:
+        return EXIT_WRITE_FAILED
+
+    # 6/7. ca.key/ca.crt are never referenced past the two os.path.isfile
+    # checks at the very top of this function -- no code path above ever
+    # opens, reads, or copies either one. Only the per-host <name>.crt/
+    # <name>.png/alloc-<name>.json writes and the single registry.json copy
+    # above ever touch out_dir (module docstring).
+    return EXIT_OK
+
+
+def main(argv):
+    if len(argv) != 4:
+        print(f"usage: {argv[0]} <job.json> <payload_dir> <out_dir>", file=sys.stderr)
+        return EXIT_FAULT
+    _, job_path, payload_dir, out_dir = argv
+
+    try:
+        with open(job_path, "rb") as f:
+            job = json.loads(f.read())
+    except (OSError, ValueError):
+        print("sign-hosts: bad_manifest", file=sys.stderr)
+        return EXIT_BAD_MANIFEST
+    if not isinstance(job, dict):
+        print("sign-hosts: bad_manifest", file=sys.stderr)
+        return EXIT_BAD_MANIFEST
+
+    try:
+        rc = run(job, payload_dir, out_dir)
+    except OSError as exc:
+        # Mirrors ca-bootstrap's identical outer safety net: run() is
+        # designed to catch every foreseeable OSError itself, so this is
+        # belt-and-suspenders, not the primary contract.
+        print(f"sign-hosts: fault: {exc}", file=sys.stderr)
+        return EXIT_WRITE_FAILED
+
+    if rc != EXIT_OK:
+        print(f"sign-hosts: {_REASON_BY_EXIT.get(rc, 'fault')}", file=sys.stderr)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

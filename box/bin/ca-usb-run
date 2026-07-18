@@ -1,0 +1,1274 @@
+#!/usr/bin/env python3
+"""ca-usb-run -- ca-usb-job@.service's ExecStart/ExecStopPost entrypoint: the
+full signed-job lifecycle orchestrator. This file WIRES every prior module
+into the state
+machine that runs the whole ceremony once udev fires `ca-usb-job@sdaN` on an
+inserted vfat partition.
+
+**Grew out of an earlier wiring stub.** The scaffolding that stub proved end
+to end -- the global cross-instance `flock` (contended -> BUSY LED, exit 0,
+touches no state), the ExecStopPost/RemainAfterExit LED-reset + payload-tmpfs
+wipe, and the exit-code contract -- is PRESERVED verbatim below. What this
+file adds is `run()`'s real body: the pipeline the stub deliberately left out.
+
+**The pipeline order, all under the flock:**
+  1. `mountctl.mount_ro` -- pinned vfat ro,noexec,nosuid,nodev (abort if not
+     vfat). The stick is mounted at MNT_DIR (a private mountpoint under the
+     unit's ReadWritePaths=/run/ca-usb).
+  2. `inbox/job.tar` ABSENT -> recovery branch (K1-gated). PRESENT-but-bad
+     -> fail closed, NEVER recovery.
+  3. Copy `job.tar`(+`.sig`,+optional `.bg.sig`) -> root tmpfs (size-capped).
+     After this the stick is only WRITTEN, never re-read; we never chdir into
+     the mount.
+  4. Verify the TMPFS copy (`verify.verify` against config.ALLOWED). On failure,
+     the break-glass-ALONE fallback (`verify.verify_breakglass_primary`
+     against config.BREAKGLASS) may authenticate the SAME primary-slot signature
+     -> `bg_authorized` bool, honored ONLY for a `rotate-job-signers` operation
+     (gated after parse). Optional break-glass co-sign (`verify.verify_cosign`)
+     -> `cosigned` bool (never computed for a bg-authorized job).
+  5. Extract (`extract`, openat2-hardened) + parse `manifest.json`
+     (`manifest.parse`) + freshness (`freshness.check`). A consumed job_id ->
+     REPLAY (deliver cached bytes, still K1-gated, never re-run).
+  6. LED READY -> K1 gate (`button.await_press`). Timeout/anti-tamper (False)
+     -> no_confirmation.
+  7. Dispatch (`dispatch.run`) -> rc (or DispatchError if nothing could run).
+  8. COMMIT on-box FIRST: `collect.collect` (symlink-safe) then
+     `commitlog.commit` (results/<job_id>/ + status.json + DONE + seq bump,
+     fsync'd atomically). THE commit point -- never deliver before it.
+  9. Deliver: `mountctl.mount_rw`, copy results/<job_id>/ -> outbox/<job_id>/
+     atomically, write the single top-level `outbox/LATEST.json` LAST (the
+     reader's commit gate), `sync`.
+ 10. `mountctl.umount` (retry EBUSY, never `-l`); only on umount==0 does the
+     terminal LED (SAFE_REMOVE on success, else ERROR) get set.
+
+**The abort/commit boundary.**
+- Failures BEFORE freshness passes (mount/verify/extract/manifest/freshness
+  errors) have NO legitimately-consumed seq/job_id, so they are LED-ONLY: LED
+  ERROR + `umount`, NEVER `commitlog.commit` (there is no valid seq to
+  consume) and nothing is delivered to the stick.
+- Aborts AFTER freshness passes that WRITE an outbox status.json do so via
+  `commitlog.commit()` so the seq is consumed and caj-recv's reconcile-forward
+  holds: `no_confirmation` (K1 timeout -- occurs before dispatch, yet still
+  commits) and a handler that RAN and returned rc!=0 (`handler_failed`), plus
+  a post-run collection failure. Every such path commits BEFORE it delivers.
+- A `dispatch.DispatchError` (raised == the handler was REFUSED before any exec
+  -- `cosign_failed`, or dispatch's own defense-in-depth `bad_manifest`/
+  `handler_failed`) is treated like `verify_failed`: NOTHING ran, so no seq is
+  consumed and it is LED-ONLY (the operator can add the missing co-signature to
+  the SAME stick and re-insert at the SAME seq; a committed job_id could never
+  be retried without minting a fresh one).
+
+**The error enum is the ONLY vocabulary** that reaches the operator: every
+module `.reason` is mapped into `_ERROR_ENUM` before it is written to a
+status.json or logged as the terminal reason; raw stderr/tracebacks never
+cross to the stick.
+
+**Exit-code contract (unchanged from the stub, verified against systemd 257).**
+`run()` returns EXIT_OK (0) for EVERY expected terminal
+(busy / recovery / success / handled error / no_confirmation), so
+Type=oneshot+RemainAfterExit=yes holds the terminal LED until stick removal.
+EXIT_FAULT (1) is reserved for a genuine environment/hardware fault with no
+sensible LED to hold anyway (K1 device unresolvable -> `button.ButtonError`, a
+`user_led` sysfs write failing -> `led.LedError`, or the lock path itself
+inaccessible); those propagate to `main()`, which is the sole mapper to
+EXIT_FAULT. Every module error that DOES have a meaningful LED to show is
+caught inside `run()` and returns EXIT_OK.
+
+**ExecStopPost=--cleanup** resets the LED to IDLE and wipes the payload tmpfs
+on every stop; it must never raise. The stick mount, if one is still live on a
+mid-run yank, is torn down by the unit's own private mount namespace
+(PrivateMounts=yes) when systemd stops the unit -- cleanup() does not need to
+(and deliberately does not) umount, keeping its "never raises" contract simple.
+"""
+
+import errno
+import fcntl
+import json
+import os
+import shutil
+import sys
+from datetime import datetime, timezone
+
+# APPEND (not insert(0)) the installed package dir: in production nothing else
+# on sys.path provides `causb`, so the appended /usr/local/lib is where it is
+# found; but an EXPLICIT `PYTHONPATH` (e.g. a source checkout's box/lib, as the
+# on-box test runner sets) must be honoured rather than silently shadowed by a
+# possibly-STALE installed copy. Prepending would force the installed copy to
+# win even over PYTHONPATH -- which breaks the moment the source grows a module
+# (e.g. `recovery`) the installed copy predates, exactly the kind of skew this
+# capstone introduced before a fresh install.sh run.
+sys.path.append("/usr/local/lib")
+
+from causb import (  # noqa: E402  (see sys.path.append above)
+    audit,
+    button,
+    collect,
+    commitlog,
+    config,
+    dispatch,
+    extract,
+    freshness,
+    led,
+    manifest,
+    mountctl,
+    recovery,
+    registry,
+    verify,
+)
+
+LOCK_PATH = "/run/ca-usb/lock"
+TMPFS_DIR = "/run/ca-usb-tmp"
+# Private mountpoint for the (untrusted) stick. A subdir of the unit's
+# ReadWritePaths=/run/ca-usb (tmpfiles.d-provisioned 0700), kept separate from
+# the trusted payload tmpfs so an untrusted-stick mount and the trusted
+# extract/out/collect trees never share a directory. PrivateMounts=yes makes it
+# per-instance, so two sticks never see each other's mount.
+MNT_DIR = "/run/ca-usb/mnt"
+
+# Second-K1-press window for the recovery registry.json opt-in ("distinct
+# second confirmation"). Deliberately SHORT (unlike the 60 s primary K1
+# window): the common case is a single press -> confirm2=False (public-only
+# kit), and the operator must not have to wait a full minute for the second
+# window to lapse before the default kit is written. A caller who wants the
+# sensitive registry double-presses well within this.
+RECOVERY_CONFIRM2_WINDOW_S = 8
+
+# Size caps for the tmpfs copy step ("size-capped"): the whole job.tar is
+# bounded by the same CAPS["tar_bytes"] the extractor enforces on its
+# uncompressed contents, so a hostile multi-gigabyte job.tar can never fill the
+# 32 MB payload tmpfs before extraction even begins; the detached signatures
+# are tiny (an ed25519 SSHSIG is ~570 bytes) so a small generous ceiling
+# rejects a bogus giant "signature" the same fail-closed way.
+_SIG_CAP_BYTES = 65536
+
+EXIT_OK = 0
+EXIT_FAULT = 1
+
+# The ONLY permitted status.json.error values. Every module reason is
+# mapped INTO this set before it is written or logged as a terminal reason --
+# a value outside it is a bug in this file, so `_status_error` asserts
+# membership rather than let an un-enumerated string leak to the operator.
+_ERROR_ENUM = frozenset(
+    {
+        "verify_failed",
+        "cosign_failed",
+        "stale_seq",
+        "dup_job_id_replayed",
+        "wrong_box",
+        "bad_manifest",
+        "jobs_gt_1",
+        "path_traversal",
+        "oversize",
+        "cap_exceeded",
+        "clock_insane",
+        "no_confirmation",
+        "handler_failed",
+        "mount_failed",
+        "deliver_failed",
+    }
+)
+
+# Module `.reason` -> the enum above, for the two modules whose own reason strings
+# are NOT already a subset of the enum (see each module's docstring note):
+#   causb.extract  "bad_tar"    -> "bad_manifest" (a malformed bundle archive)
+#   causb.collect  "bad_output" -> "handler_failed" (the run left unusable output)
+_REASON_MAP = {"bad_tar": "bad_manifest", "bad_output": "handler_failed"}
+
+# Control files commit()/deliver treat specially: never delivered to the stick,
+# never accepted as a job-produced output name.
+_DONE_NAME = "DONE"
+_STATUS_NAME = "status.json"
+_LATEST_NAME = "LATEST.json"
+_ERROR_NAME = "ERROR.json"  # on-stick pre-commit failure breadcrumb
+
+
+def _log(msg):
+    print(f"ca-usb-run: {msg}", file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------------
+# flock + tmpfs scaffolding (PRESERVED from the earlier stub verbatim)
+# --------------------------------------------------------------------------
+
+
+def _acquire_lock(path):
+    """Open (create if absent) and try to `flock(path, LOCK_EX|LOCK_NB)`, fd
+    `O_CLOEXEC` (the fd must not leak into a `run-script` child).
+    Returns the held fd on success, or None WITHOUT raising if another holder
+    already has it (the routine "busy" outcome), distinguished from every other
+    OSError (e.g. the lock directory missing -- a real environment fault) which
+    propagates instead.
+    """
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        os.close(fd)
+        if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            return None
+        raise
+    return fd
+
+
+def _release_lock(fd):
+    """Explicit unlock + close (belt-and-suspenders over process-exit +
+    O_CLOEXEC), so the release point is obvious and correct even if `run()` is
+    ever called in-process by a test rather than via a fresh exec."""
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    os.close(fd)
+
+
+def _wipe_tmpfs(tmpfs_dir):
+    """Best-effort clear of the payload tmpfs's CONTENTS (ExecStopPost's "wipe
+    the payload tmpfs" half). Never raises -- a missing/already-gone
+    tmpfs, or an OSError listing/removing an entry, is not a cleanup failure
+    (cleanup() must never fail for what is routine)."""
+    if not os.path.isdir(tmpfs_dir):
+        return
+    try:
+        for name in os.listdir(tmpfs_dir):
+            path = os.path.join(tmpfs_dir, name)
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.unlink(path)
+    except OSError:
+        pass
+
+
+def cleanup():
+    """ExecStopPost= body: reset LED to IDLE + wipe the payload tmpfs.
+    Runs on every stop of this unit invocation -- must never raise and must not
+    assume any particular prior LED/tmpfs state."""
+    try:
+        led.set(led.IDLE)
+    except led.LedError as exc:
+        _log(f"cleanup: LED reset failed (non-fatal): {exc}")
+    _wipe_tmpfs(TMPFS_DIR)
+    return EXIT_OK
+
+
+# Fields `allocation_record()`/sign-hosts's `alloc-<name>.json` always
+# carries, and that `registry.reconcile()`'s own body (plus its `(seq, name,
+# pubkey_sha256)` sort key) unconditionally subscripts. A parsed record
+# missing, or holding a non-str value for, any of these -- or whose `seq`
+# isn't a real (non-bool) int -- is exactly the "corrupt/absent" shape the
+# spec calls out; `_valid_alloc_record` below is what turns that
+# into a per-record SKIP rather than a raised KeyError/TypeError that would
+# otherwise abort `registry.reconcile()`'s whole batch (discarding every
+# OTHER, perfectly good record right along with the bad one).
+_ALLOC_STR_FIELDS = ("name", "ip", "pubkey_sha256", "fingerprint", "not_after")
+
+
+def _valid_alloc_record(rec):
+    """Structural check for one parsed `alloc-*.json` dict -- see
+    `_ALLOC_STR_FIELDS`'s comment above. `groups` is not REQUIRED (absent or
+    `None` is fine: `registry.reconcile()` itself already tolerates that via
+    `rec.get("groups") or []`, mirroring `allocation_record()`'s own
+    optional-groups contract) -- but if PRESENT it must be a `list`: that
+    same `rec.get("groups") or []` expression calls `list(...)` on whatever
+    a TRUTHY `groups` value is, so a corrupt-but-truthy non-iterable (e.g.
+    an `int`) would otherwise raise `TypeError` INSIDE `registry.reconcile
+    ()`'s single call over the WHOLE batch of records -- crashing every
+    other, perfectly good record's reconcile right along with this one bad
+    one, exactly the failure mode this whole function exists to prevent."""
+    if not isinstance(rec, dict):
+        return False
+    for key in _ALLOC_STR_FIELDS:
+        if not isinstance(rec.get(key), str):
+            return False
+    seq = rec.get("seq")
+    if not isinstance(seq, int) or isinstance(seq, bool):
+        return False
+    groups = rec.get("groups")
+    if groups is not None and not isinstance(groups, list):
+        return False
+    return True
+
+
+def _load_alloc_records(results_dir):
+    """Scan `{results_dir}/*/alloc-*.json` (sign-hosts's own per-host
+    allocation artifact -- one file per signed host, `registry.py`'s module
+    docstring) and return the list of well-formed records found. A missing
+    `results_dir` yields `[]` (a box that has never committed a job has
+    nothing to reconcile). Every per-entry failure -- an unreadable
+    `results_dir`/job dir, a symlinked entry (never followed), a corrupt/
+    non-JSON `alloc-*.json`, or a structurally wrong-shaped value -- is
+    logged and SKIPPED, never raised: one bad record must not discard
+    every other job's legitimate allocation, and this scan itself must
+    never be what fails the boot unit (see `_reconcile_registry`'s own
+    outer catch-all, which this function's callers rely on for anything
+    this loop doesn't already handle per-entry)."""
+    records = []
+    if not os.path.isdir(results_dir):
+        return records
+    for job_id in sorted(os.listdir(results_dir)):
+        job_dir = os.path.join(results_dir, job_id)
+        # Refuse a symlinked job DIR before descending -- os.path.isdir()
+        # FOLLOWS a symlink, so without this an attacker-planted (or
+        # crash-corrupted) results/<job_id> symlink pointing at an outside
+        # directory would have that directory's alloc-*.json read as trusted
+        # records (the per-FILE islink check below never fires, since a real
+        # file in the target isn't itself a symlink). Mirrors
+        # commitlog.reconcile_on_boot's own lstat+S_ISLNK skip of a symlinked
+        # job entry -- which runs immediately before this scan over the same
+        # tree and LEAVES such a symlink in place (never purged), so this
+        # scan is what must refuse to follow it. islink-BEFORE-isdir.
+        if os.path.islink(job_dir):
+            _log(f"reconcile: skipping symlinked results dir {job_id!r} (never followed)")
+            continue
+        if not os.path.isdir(job_dir):
+            continue
+        try:
+            entries = sorted(os.listdir(job_dir))
+        except OSError as exc:
+            _log(f"reconcile: skipping unreadable results dir {job_id!r}: {exc!r}")
+            continue
+        for name in entries:
+            if not (name.startswith("alloc-") and name.endswith(".json")):
+                continue
+            path = os.path.join(job_dir, name)
+            # Refuse-if-symlink, never follow -- mirrors
+            # causb.commitlog._lstat_or_none's identical posture for this
+            # exact tree (RESULTS_DIR is root:root 0700, populated only by
+            # commitlog.commit()'s own atomic tmp->rename writes, which
+            # never create a symlink; a symlinked entry here has no
+            # legitimate origin). Checked via a plain lstat-equivalent
+            # (os.path.islink), not a full openat-hardened descent -- that
+            # heavier posture (causb.collect) exists for handler-controlled
+            # out_dir trees a vetted handler or run-script could influence;
+            # this tree is harness-internal only, the same trust tier
+            # commitlog.reconcile_on_boot (which runs immediately before
+            # this scan, over this same tree) already treats this way.
+            if os.path.islink(path):
+                _log(f"reconcile: skipping symlinked alloc entry {job_id}/{name} (never followed)")
+                continue
+            try:
+                with open(path, "rb") as f:
+                    rec = json.loads(f.read())
+            except (OSError, ValueError) as exc:
+                _log(f"reconcile: skipping corrupt alloc record {job_id}/{name}: {exc!r}")
+                continue
+            if not _valid_alloc_record(rec):
+                _log(f"reconcile: skipping malformed alloc record {job_id}/{name}")
+                continue
+            records.append(rec)
+    return records
+
+
+def _reconcile_registry():
+    """`--reconcile`'s SECOND repair pass, layered on top of
+    `commitlog.reconcile_on_boot()`: rebuild `registry.json` (
+    "rebuildable cache, never authoritative" -- `causb.registry`'s own
+    module docstring) from every committed `alloc-*.json` allocation record
+    still on disk, so a power-loss between a sign-hosts commit and the
+    box's next boot can never leave the registry.json CACHE out of sync
+    with the certs the box actually issued.
+
+    The overlay this rebuild uses is the CURRENT registry.json's own
+    `overlay_cidr` if one is already on file (mirrors sign-hosts' own "the
+    registry, not a default, owns the overlay" stance), falling back to
+    `config.OVERLAY_CIDR` only for a box with no registry.json yet (nothing
+    bootstrapped or reconciled before).
+
+    STRICTLY NON-FATAL, by design. Every per-record defect is already
+    skipped inside `_load_alloc_records`; this function's own outer
+    catch-all means even a totally unexpected failure (e.g. `RESULTS_DIR`
+    unreadable, a corrupt on-disk registry.json, `registry.save()` hitting
+    a durability fault) is logged and SWALLOWED rather than raised -- the
+    boot unit's exit code is never changed by this step. This deliberately
+    differs from `commitlog.reconcile_on_boot`'s own established
+    EXIT_FAULT-on-failure contract (preserved untouched in `reconcile()`
+    below): that call guards the seq/consumed-jobs caches driving replay/
+    freshness correctness, a hard boot-time gate worth surfacing loudly.
+    THIS is a boot-time convenience rebuild of a strictly-derived cache
+    every reader already treats as possibly-stale/absent (`registry.load`'s
+    own "absent file -> empty registry" contract), so failing to rebuild
+    it must never itself block the box from finishing booting -- a missing
+    or empty RESULTS_DIR is simply "nothing to do", not an error.
+    """
+    try:
+        records = _load_alloc_records(config.RESULTS_DIR)
+
+        try:
+            current = registry.load(config.REGISTRY)
+            overlay = current.get("overlay_cidr") or config.OVERLAY_CIDR
+        except registry.RegistryError:
+            overlay = config.OVERLAY_CIDR
+
+        registry.save(registry.reconcile(records, overlay), config.REGISTRY)
+        _log(f"registry.json reconciled from {len(records)} allocation record(s)")
+    except Exception as exc:  # noqa: BLE001 -- never fail the boot unit over this
+        _log(f"registry reconcile skipped (non-fatal): {exc!r}")
+
+
+def reconcile():
+    """`--reconcile` body -- ca-usb-reconcile.service's ExecStart (restart
+    recovery, fault-injection gate). Rebuild the
+    seq/consumed-jobs caches from the durable `results/<job_id>/DONE` markers
+    and purge any pre-`DONE` partial job dir a power-cut left mid-commit, so a
+    job's seq/idempotency state is consistent after an unclean shutdown. Then
+    rebuild `registry.json` itself from every committed
+    sign-hosts allocation record still on disk -- see `_reconcile_registry`'s
+    own docstring for why that second step can never turn a successful
+    `commitlog.reconcile_on_boot()` pass into a boot failure.
+
+    Runs as ROOT at boot, ordered BEFORE any udev-triggered `ca-usb-job@`
+    instance could run (see ca-usb-reconcile.service), so it deliberately takes
+    NO flock -- the boot ordering, not a lock, guarantees no commit() runs
+    concurrently. Returns EXIT_OK on success (INCLUDING a clean/empty store,
+    which is the normal every-boot case) and EXIT_FAULT only on a genuine
+    reconcile fault, so a failed recovery surfaces in the boot journal rather
+    than being silently masked (fail closed)."""
+    try:
+        commitlog.reconcile_on_boot()
+    except Exception as exc:  # noqa: BLE001 -- any genuine fault -> visible nonzero exit
+        _log(f"reconcile failed, failing closed: {exc!r}")
+        return EXIT_FAULT
+    _log("reconcile complete (seq/consumed-jobs rebuilt from DONE markers)")
+    _reconcile_registry()
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------
+# small orchestrator helpers (each an injectable/mockable seam for tests)
+# --------------------------------------------------------------------------
+
+
+def _utcnow():
+    """Current UTC time. The box has a real RTC, so a wall-clock
+    stamp is legitimate here (unlike the box's freshness gate, which distrusts
+    it). Isolated in one function purely so a test can pin the year (to drive
+    the clock_insane branch) and the started/finished stamps."""
+    return datetime.now(timezone.utc)
+
+
+def _iso(dt):
+    """ISO-UTC status.json timestamp, e.g. 2026-07-13T10:20:30Z -- the
+    same shape causb.dispatch's audit line uses."""
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _sync():
+    """`sync` the filesystems after an outbox delivery (mirrors `sync
+    --file-system`). os.sync() flushes every mounted fs, which safely covers
+    the vfat stick without needing to name it. Its own function purely as a
+    test seam."""
+    os.sync()
+
+
+class _CopyOversize(Exception):
+    """A tmpfs copy exceeded its size cap -> "oversize"."""
+
+
+def _copy_capped(src, dst, cap):
+    """Copy `src` -> `dst`, refusing (raising `_CopyOversize`) once more than
+    `cap` bytes would be read. Reads cap+1 bytes: >cap means oversize. Both
+    files are small by construction (a job.tar bounded to CAPS["tar_bytes"], a
+    tiny detached signature), so a single read into memory is fine."""
+    with open(src, "rb") as fsrc:
+        data = fsrc.read(cap + 1)
+    if len(data) > cap:
+        raise _CopyOversize()
+    with open(dst, "wb") as fdst:
+        fdst.write(data)
+
+
+def _fresh_dir(path):
+    """Return `path` as a freshly-empty directory (rmtree any stale contents
+    from a belt-and-suspenders standpoint, then recreate). The payload tmpfs is
+    private + ExecStopPost-wiped, so this is defensive, not load-bearing."""
+    if os.path.islink(path) or os.path.exists(path):
+        shutil.rmtree(path, ignore_errors=True)
+        if os.path.lexists(path):
+            os.unlink(path)
+    os.makedirs(path)
+    return path
+
+
+def _status_error(reason):
+    """Assert `reason` is a real enum value and return it. A reason that
+    somehow isn't enumerated is a bug in THIS file's mapping -- fail closed to
+    a generic enum value rather than write an unknown string to the stick."""
+    if reason in _ERROR_ENUM:
+        return reason
+    _log(f"BUG: non-enum error reason {reason!r}; coercing to handler_failed")
+    return "handler_failed"
+
+
+def _audit(*, job_id, operation, principal, status, seq,
+           replayed=False, exit_code=None, cosigned=None):
+    """Append ONE per-job audit JSONL line via the shared
+    `causb.audit` writer -- on-box, under the flock. This is the forensic
+    record the primary residual (a misused signer key) relies on: it names
+    the signer `principal`, the `operation`, the terminal `status` (a
+    status/error value, or "ok"), and the seq/replayed/exit_code/cosigned
+    context. Fields not yet known at a given terminal (e.g. `principal` before
+    verify, `job_id`/`seq` before manifest parse) are passed as `None` -- the
+    line is always the same fixed shape.
+
+    FAIL-SAFE: a failure to write the audit line must NEVER break the
+    terminal/LED/unmount path. A lost audit line is bad; a stuck stick (or a
+    medium left mounted) is worse, so any writer error is caught and logged,
+    never propagated. (Contrast causb.dispatch's privileged-run audit, which
+    is deliberately fail-CLOSED because it gates a root exec.)"""
+    entry = {
+        "ts": _iso(_utcnow()),
+        "job_id": job_id,
+        "operation": operation,
+        "principal": principal,
+        "status": status,
+        "seq": seq,
+        "replayed": bool(replayed),
+        "exit_code": exit_code,
+        "cosigned": cosigned,
+    }
+    try:
+        audit.append(entry, path=config.AUDIT_LOG)
+    except Exception as exc:  # noqa: BLE001 -- fail-safe: never break the terminal path
+        _log(f"audit append failed (non-fatal): {exc!r}")
+
+
+def _atomic_write_bytes(dir_path, name, data):
+    """Write `data` as `name` inside `dir_path` via tmp -> fsync -> rename
+    (atomic per-file delivery). On a vfat stick fsync/rename are weaker
+    than on ext4 -- which is exactly why LATEST.json (written last) is the
+    reader's commit gate, not any single file's rename."""
+    final_path = os.path.join(dir_path, name)
+    tmp_path = final_path + ".tmp"
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, final_path)
+
+
+def _fsync_dir_best_effort(path):
+    """fsync a directory fd if the filesystem supports it; a vfat mount may
+    reject an fsync on a directory (EINVAL), which is harmless here because the
+    LATEST.json gate -- not a directory fsync -- is what the reader trusts."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _best_effort_umount():
+    """`mountctl.umount(MNT_DIR)` (retries EBUSY, never `-l`), returning True
+    only on a genuine umount==0. Any MountError (busy budget exhausted, or a
+    non-busy failure) -> False: the medium is NOT safely removable, so the
+    caller must show ERROR, never SAFE_REMOVE."""
+    try:
+        mountctl.umount(MNT_DIR)
+        return True
+    except mountctl.MountError as exc:
+        _log(f"umount failed: {exc.reason}")
+        return False
+
+
+def _finish(success):
+    """Terminal step: `umount`, and ONLY on umount==0 set the held LED --
+    SAFE_REMOVE on a genuine success, else ERROR. If umount fails the medium is
+    still mounted, so SAFE_REMOVE (which tells the operator to physically pull
+    the stick) must never be shown -> ERROR. Always returns EXIT_OK (an
+    expected terminal)."""
+    umount_ok = _best_effort_umount()
+    led.set(led.SAFE_REMOVE if (success and umount_ok) else led.ERROR)
+    return EXIT_OK
+
+
+def _write_error_breadcrumb(reason, phase, *, job_id, seq, bundle_id):
+    """Best-effort: drop a bounded `outbox/ERROR.json` on the (AUTHENTICATED)
+    stick so a pre-commit failure -- one that aborts AFTER signature
+    verification but BEFORE commit -- is troubleshootable once the box is
+    air-gapped and only the LED talks. Writes NO
+    LATEST.json and consumes NO seq: the operator can fix the job and re-insert
+    at the SAME seq.
+
+    FAIL-SAFE, exactly like `_audit`: ANY error (full/ro/yanked stick, remount
+    refused) is logged and swallowed -- the caller's LED-ERROR terminal must
+    never be masked, nor a new failure mode introduced. `reason` is passed
+    through `_status_error` so only an enum value can ever be written; the
+    breadcrumb carries no free-form text, stderr, or paths (an info-disclosure
+    posture). `job_id`/`seq`/`bundle_id` are best-effort: null when the failure
+    aborted before the manifest yielded them (extract / early manifest)."""
+    # Everything -- including payload construction (config.SCHEMA_VERSIONS["error"]
+    # could KeyError under a partial install skew: new ca-usb-run + old config.py)
+    # -- lives inside the fail-safe try, so NOTHING here can escape to the caller
+    # and skip its _finish(success=False) terminal.
+    try:
+        payload = {
+            "schema_version": config.SCHEMA_VERSIONS["error"],
+            "box": config.BOX_NAME,
+            "ts": _iso(_utcnow()),
+            "reason": _status_error(reason),
+            "phase": phase,
+            "job_id": job_id,
+            "seq": seq,
+            "bundle_id": bundle_id,
+        }
+        outbox = os.path.join(MNT_DIR, "outbox")
+        mountctl.mount_rw(MNT_DIR)
+        os.makedirs(outbox, exist_ok=True)
+        _atomic_write_bytes(
+            outbox, _ERROR_NAME, json.dumps(payload, indent=2, sort_keys=True).encode()
+        )
+        _fsync_dir_best_effort(outbox)
+    except Exception as exc:  # noqa: BLE001 -- fail-safe: never break the terminal path
+        _log(f"error breadcrumb write failed (non-fatal): {exc!r}")
+
+
+def _fail_pre_freshness(reason, *, phase=None, job_id=None, operation=None,
+                        principal=None, seq=None, cosigned=None, bundle_id=None):
+    """A failure with NO legitimately-consumed seq/job_id (mount/verify/
+    extract/manifest/freshness, or a refused-before-exec dispatch): LED-ONLY.
+    Nothing is committed (there is no valid seq to consume) and nothing is
+    delivered to the stick -- just log the enum reason for the journal, then
+    umount and hold ERROR.
+
+    Also appends ONE fail-safe audit line recording the refusal with
+    whatever context is known so far (null for fields not yet parsed -- e.g.
+    `principal` is null for a pre-verify refusal, `job_id`/`seq` are null
+    before manifest parse): the forensic trail must capture REFUSED/attempted
+    operations, not only committed ones, since a stale/unsigned/wrong-box/
+    un-cosigned presentation is exactly the kind of event the misused-signer-
+    key residual relies on having on record.
+
+    If `phase` is non-None the failure is POST-signature-verification (an
+    AUTHENTICATED job aborting before commit): a best-effort ERROR.json
+    breadcrumb is left on the stick. `phase` stays None for the two
+    pre-verify sites (unsigned / wrong-key) and the mount failure, which remain
+    strictly LED-only -- we never remount an unverified stick rw. The PRESENCE
+    of the breadcrumb is therefore the sole signal distinguishing an
+    authenticated-but-refused job (e.g. the break-glass scope reject, which also
+    reuses reason=verify_failed) from a genuinely forged/unsigned one."""
+    reason = _status_error(reason)
+    _audit(job_id=job_id, operation=operation, principal=principal,
+           status=reason, seq=seq, cosigned=cosigned)
+    _log(f"fail-closed (pre-commit): {reason}")
+    if phase is not None:
+        _write_error_breadcrumb(reason, phase, job_id=job_id, seq=seq,
+                                bundle_id=bundle_id)
+    return _finish(success=False)
+
+
+# --------------------------------------------------------------------------
+# status.json / LATEST.json construction
+# --------------------------------------------------------------------------
+
+
+def _build_out_status(status_val, presence_confirmed, exit_code, error, started, finished):
+    """The status.json fields THIS orchestrator owns. `commitlog.commit`
+    fills in/overwrites `job_id`, `seq`, and `outputs` itself, so they are
+    deliberately absent here (a caller cannot smuggle a mismatched job_id/seq).
+    `error` is None on success, else a validated enum value."""
+    return {
+        "schema_version": config.SCHEMA_VERSIONS["status"],
+        "status": status_val,
+        "box": config.BOX_NAME,
+        "started_at": _iso(started),
+        "finished_at": _iso(finished),
+        "presence_confirmed": bool(presence_confirmed),
+        "exit_code": exit_code,
+        "error": None if error is None else _status_error(error),
+        "replayed": False,
+    }
+
+
+def _write_latest(bundle_id, seq, job_id, status_val, replayed):
+    """Write the single top-level `outbox/LATEST.json` -- the reader's
+    commit gate, written LAST of everything delivered."""
+    outbox = os.path.join(MNT_DIR, "outbox")
+    latest = {
+        "bundle_id": bundle_id,
+        "box": config.BOX_NAME,
+        "seq": seq,
+        "job_id": job_id,
+        "status": status_val,
+        "replayed": bool(replayed),
+    }
+    _atomic_write_bytes(
+        outbox, _LATEST_NAME, json.dumps(latest, indent=2, sort_keys=True).encode()
+    )
+    # A FRESH committed delivery (replayed=False) supersedes any stale pre-commit
+    # ERROR.json breadcrumb from an EARLIER failed attempt on this stick: it
+    # consumed a NEW seq, so it is strictly later than that pre-commit abort. A
+    # REPLAY (replayed=True) re-delivers an OLDER already-committed result and
+    # must NOT clear a possibly-newer breadcrumb. (Within one run the breadcrumb
+    # path and this LATEST.json path are mutually exclusive -- a run reaching here
+    # never took a _fail_pre_freshness path -- so this only ever hits a stale
+    # earlier-run breadcrumb.) Best-effort; absence is the normal case.
+    if not replayed:
+        try:
+            os.unlink(os.path.join(outbox, _ERROR_NAME))
+        except OSError:
+            pass
+    _fsync_dir_best_effort(outbox)
+
+
+def _copy_dir_to_outbox(src_dir, job_id, *, exclude):
+    """Copy every file in the trusted on-box `src_dir` (results/<job_id>/)
+    whose name is not in `exclude` into `outbox/<job_id>/` on the stick, each
+    atomically (tmp->fsync->rename). `src_dir` is a root-only store whose
+    contents `causb.collect`/`causb.commitlog` already guarantee are plain
+    regular files (no symlink to follow), so a plain read is safe here; the
+    stick side is a pinned-vfat mount that cannot hold a symlink."""
+    dst = os.path.join(MNT_DIR, "outbox", job_id)
+    os.makedirs(dst, exist_ok=True)
+    for name in sorted(os.listdir(src_dir)):
+        if name in exclude:
+            continue
+        with open(os.path.join(src_dir, name), "rb") as f:
+            data = f.read()
+        _atomic_write_bytes(dst, name, data)
+    _fsync_dir_best_effort(dst)
+
+
+def _deliver_and_finish(job_id, seq, bundle_id, status_val, *, success):
+    """Deliver of an ALREADY-COMMITTED job: remount rw, copy
+    results/<job_id>/ (minus the box-internal DONE marker) -> outbox/<job_id>/,
+    write LATEST.json LAST, sync, then umount+LED. A deliver failure
+    AFTER the on-box commit leaves the committed bytes intact for a future
+    `caj --retry` (the outbox has no LATEST.json, so caj-recv ignores the
+    partial) -> ERROR, never a lost commit."""
+    src_dir = os.path.join(config.RESULTS_DIR, job_id)
+    try:
+        mountctl.mount_rw(MNT_DIR)
+        _copy_dir_to_outbox(src_dir, job_id, exclude={_DONE_NAME})
+        _write_latest(bundle_id, seq, job_id, status_val, replayed=False)
+        _sync()
+    except (mountctl.MountError, OSError) as exc:
+        _log(f"deliver failed ({exc!r}); committed on-box results retained")
+        return _finish(success=False)
+    return _finish(success=success)
+
+
+# --------------------------------------------------------------------------
+# post-dispatch: collect -> commit -> deliver
+# --------------------------------------------------------------------------
+
+
+def _collect_outputs(out_dir, collect_dir, rc):
+    """Symlink-safely gather the handler's outputs from the untrusted `out_dir`
+    and shape them for `commitlog.commit`. Returns
+    `(status_val, error, commit_outputs)`:
+
+    - `commit_outputs` is `[{"path": <flat name>, "data": <bytes>}]` read back
+      from the TRUSTED `collect_dir` copy (collect guarantees it holds only
+      plain regular files, so a plain read is safe).
+    - A CollectError maps into the enum: path_traversal/cap_exceeded ->
+      status "aborted" with that reason; bad_output -> "error"/handler_failed.
+    - An output name that commit()/caj-recv could not accept (a nested path, or
+      a reserved DONE/status.json name -- both outside the flat-basename wire
+      contract caj-recv enforces) -> "error"/handler_failed, fail closed with
+      no outputs rather than a raw ValueError out of commit().
+    - Otherwise: rc==0 -> "ok"/None; rc!=0 (incl. 124 timeout) ->
+      "error"/handler_failed, still carrying whatever the run did produce."""
+    try:
+        collected = collect.collect(out_dir, collect_dir)
+    except collect.CollectError as exc:
+        reason = _REASON_MAP.get(exc.reason, exc.reason)
+        if reason == "handler_failed":
+            return "error", "handler_failed", []
+        # path_traversal / cap_exceeded: the run happened but its output tree
+        # is unusable -> a harness ABORT ("aborted=harness aborted/cap").
+        return "aborted", _status_error(reason), []
+
+    commit_outputs = []
+    for entry in collected:
+        name = entry["path"]
+        if "/" in name or name in (".", "..", _DONE_NAME, _STATUS_NAME):
+            _log(f"uncommittable output name {name!r}; failing closed")
+            return "error", "handler_failed", []
+        try:
+            with open(os.path.join(collect_dir, name), "rb") as f:
+                data = f.read()
+        except OSError as exc:
+            _log(f"reading collected output {name!r} failed ({exc!r})")
+            return "error", "handler_failed", []
+        commit_outputs.append({"path": name, "data": data})
+
+    if rc == 0:
+        return "ok", None, commit_outputs
+    return "error", "handler_failed", commit_outputs
+
+
+def _commit_and_deliver(job_id, seq, bundle_id, rc, out_dir, started, *,
+                        principal, operation, cosigned):
+    """COMMIT-then-DELIVER. collect -> build status -> `commit()` (THE
+    commit point) -> deliver. If commit itself raises (a durability fault or a
+    would-be-unsafe path), NOTHING is delivered: the on-box store is left
+    without a DONE (reconcile_on_boot purges the partial) and the outbox stays
+    empty -- deliver NEVER precedes commit.
+
+    One audit line records this committing terminal (the operation the
+    signer `principal` actually RAN, and its outcome) whether or not the
+    subsequent commit/deliver succeeds -- the handler having executed is itself
+    the forensic event this cares about; a rare commit durability fault is also
+    surfaced in the journal."""
+    collect_dir = _fresh_dir(os.path.join(TMPFS_DIR, "collect"))
+    status_val, error, commit_outputs = _collect_outputs(out_dir, collect_dir, rc)
+    out_status = _build_out_status(
+        status_val,
+        presence_confirmed=True,
+        exit_code=rc,
+        error=error,
+        started=started,
+        finished=_utcnow(),
+    )
+    # Audit `status`: the specific error reason on a non-ok terminal
+    # (handler_failed / path_traversal / cap_exceeded), else "ok" -- more
+    # forensically precise than status.json's generic "error"/"aborted"
+    # bucket, and still the same enum vocabulary.
+    audit_status = error if error is not None else status_val
+    committed = True
+    try:
+        commitlog.commit(job_id, seq, commit_outputs, out_status)
+    except (ValueError, OSError) as exc:
+        # No DONE was written -> the job is NOT committed; do not deliver.
+        _log(f"commit failed ({exc!r}); nothing delivered, on-box partial will "
+             "be purged by reconcile_on_boot")
+        committed = False
+    _audit(job_id=job_id, operation=operation, principal=principal,
+           status=audit_status, seq=seq, exit_code=rc, cosigned=cosigned)
+    if not committed:
+        return _finish(success=False)
+    return _deliver_and_finish(
+        job_id, seq, bundle_id, status_val, success=(status_val == "ok")
+    )
+
+
+def _no_confirmation(job_id, seq, bundle_id, started, *, principal, operation, cosigned):
+    """K1 timeout/anti-tamper AFTER freshness passed. This DID validate
+    a real seq, so it is committed (consuming the seq so a
+    same-stick reinsert is stale) and delivered, even though the handler
+    never ran. status "no_confirmation", no outputs, exit_code null."""
+    out_status = _build_out_status(
+        "no_confirmation",
+        presence_confirmed=False,
+        exit_code=None,
+        error="no_confirmation",
+        started=started,
+        finished=_utcnow(),
+    )
+    committed = True
+    try:
+        commitlog.commit(job_id, seq, [], out_status)
+    except (ValueError, OSError) as exc:
+        _log(f"commit of no_confirmation failed ({exc!r})")
+        committed = False
+    _audit(job_id=job_id, operation=operation, principal=principal,
+           status="no_confirmation", seq=seq, exit_code=None, cosigned=cosigned)
+    if not committed:
+        return _finish(success=False)
+    return _deliver_and_finish(
+        job_id, seq, bundle_id, "no_confirmation", success=False
+    )
+
+
+# --------------------------------------------------------------------------
+# replay: a committed job_id, re-presented via `caj --retry`
+# --------------------------------------------------------------------------
+
+
+def _replay(job_id, bundle_id, *, principal, operation, cosigned):
+    """Replay: `job_id` is already committed. Re-deliver the IDENTICAL
+    cached output bytes (never re-run the handler), still K1-gated. The
+    delivered status.json is the cached one with `replayed` flipped True (the
+    output files, and thus their status.json sha256s, are byte-for-byte
+    unchanged). A missing/corrupt cache is a should-never-happen inconsistency
+    (reconcile keeps consumed-jobs and the DONE store in sync) -> fail closed.
+
+    Every replay terminal is audited with `replayed:true`; the audited
+    `status`/`exit_code` mirror the ORIGINAL committed run (a replay never
+    re-runs, so it inherits that run's outcome)."""
+    cached = commitlog.cached_result(job_id)
+    if cached is None:
+        _log(f"replay: job_id {job_id} consumed but no cached result; failing closed")
+        # Intentionally LED-only (no phase -> no ERROR.json): a consumed job_id
+        # with a missing/unreadable cache is a should-never-happen internal
+        # inconsistency (reconcile keeps DONE + consumed-jobs in sync), outside
+        # the authenticated-pre-commit breadcrumb scope.
+        return _fail_pre_freshness("dup_job_id_replayed", job_id=job_id,
+                                   operation=operation, principal=principal, cosigned=cosigned)
+    try:
+        with open(os.path.join(cached, _STATUS_NAME)) as f:
+            cached_status = json.load(f)
+        cached_seq = cached_status["seq"]
+        cached_status_val = cached_status["status"]
+    except (OSError, ValueError, KeyError) as exc:
+        _log(f"replay: cached status.json unreadable ({exc!r}); failing closed")
+        return _fail_pre_freshness("dup_job_id_replayed", job_id=job_id,
+                                   operation=operation, principal=principal, cosigned=cosigned)
+
+    # The audited outcome reflects the ORIGINAL committed run: its error reason
+    # if it recorded one (handler_failed/no_confirmation/...), else its status
+    # value ("ok"). Both use the same enum vocabulary, since this same
+    # orchestrator wrote that cached status.json.
+    cached_exit_code = cached_status.get("exit_code")
+    cached_audit_status = cached_status.get("error") or cached_status_val
+
+    led.set(led.READY)
+    if not button.await_press(config.K1_WINDOW_S):
+        _log("replay: no K1 confirmation; leaving cached result for a later retry")
+        _audit(job_id=job_id, operation=operation, principal=principal,
+               status="no_confirmation", seq=cached_seq, replayed=True, cosigned=cosigned)
+        return _finish(success=False)
+    led.set(led.RUNNING)
+
+    _audit(job_id=job_id, operation=operation, principal=principal,
+           status=cached_audit_status, seq=cached_seq, replayed=True,
+           exit_code=cached_exit_code, cosigned=cosigned)
+
+    cached_status["replayed"] = True
+    try:
+        mountctl.mount_rw(MNT_DIR)
+        _copy_dir_to_outbox(cached, job_id, exclude={_DONE_NAME, _STATUS_NAME})
+        # Deliver the replayed status.json (replayed=True) alongside the
+        # byte-identical output files.
+        dst = os.path.join(MNT_DIR, "outbox", job_id)
+        _atomic_write_bytes(
+            dst,
+            _STATUS_NAME,
+            json.dumps(cached_status, indent=2, sort_keys=True).encode(),
+        )
+        _fsync_dir_best_effort(dst)
+        _write_latest(bundle_id, cached_seq, job_id, cached_status_val, replayed=True)
+        _sync()
+    except (mountctl.MountError, OSError) as exc:
+        _log(f"replay deliver failed ({exc!r}); cached result retained")
+        return _finish(success=False)
+    return _finish(success=True)
+
+
+# --------------------------------------------------------------------------
+# recovery branch: a blank stick (inbox/job.tar absent)
+# --------------------------------------------------------------------------
+
+
+def _recovery_branch():
+    """`inbox/job.tar` is absent -> offer to write the public-only
+    recovery kit. K1-gated, non-destructive. One press => proceed
+    (confirm2=False, public-only). A DISTINCT second press within a short
+    window => confirm2=True (also include the sensitive registry.json). No
+    press => declined; nothing is written. `confirm2` is guaranteed a real
+    bool (`is True`), never a truthy non-bool, exactly as
+    `causb.recovery.write` requires."""
+    led.set(led.RECOVERY_OFFER)
+    if not button.await_press(config.K1_WINDOW_S):
+        _log("recovery: no K1 confirmation; declining (nothing written)")
+        return _finish(success=True)  # nothing failed; stick is safe to remove
+
+    led.set(led.RECOVERY_CONFIRM2)
+    second = button.await_press(RECOVERY_CONFIRM2_WINDOW_S)
+    confirm2 = second is True  # a real bool; only a genuine 2nd press opts in
+
+    led.set(led.RECOVERY_WRITE)
+    try:
+        mountctl.mount_rw(MNT_DIR)
+        recovery.write(MNT_DIR, confirm2)
+        _sync()
+    except (mountctl.MountError, recovery.RecoveryError, OSError) as exc:
+        _log(f"recovery write failed ({exc!r})")
+        return _finish(success=False)
+    _log(f"recovery kit written (registry.json included: {confirm2})")
+    return _finish(success=True)
+
+
+# --------------------------------------------------------------------------
+# the mounted-stick pipeline (steps 3-10)
+# --------------------------------------------------------------------------
+
+
+def _process_mounted():
+    """Steps 2-10 with the stick mounted at MNT_DIR. Every terminal returns
+    EXIT_OK having umounted + set the held LED. Only genuine faults
+    (button.ButtonError / led.LedError / an unforeseen exception) escape, to be
+    handled by `_run_locked`'s fault net."""
+    inbox = os.path.join(MNT_DIR, "inbox")
+    job_tar = os.path.join(inbox, "job.tar")
+
+    # Step 2: absent job.tar -> recovery. A PRESENT-but-bad job.tar falls
+    # through to the job pipeline and fails closed there, NEVER recovery.
+    if not os.path.exists(job_tar):
+        return _recovery_branch()
+
+    # Step 3: copy job.tar (+ .sig, + optional .bg.sig) to the root tmpfs. From
+    # here the stick is only ever WRITTEN, never re-read; we never chdir in.
+    tmp_tar = os.path.join(TMPFS_DIR, "job.tar")
+    tmp_sig = os.path.join(TMPFS_DIR, "job.tar.sig")
+    tmp_bg = os.path.join(TMPFS_DIR, "job.tar.bg.sig")
+    stick_bg = os.path.join(inbox, "job.tar.bg.sig")
+    try:
+        _copy_capped(job_tar, tmp_tar, config.CAPS["tar_bytes"])
+    except _CopyOversize:
+        return _fail_pre_freshness("oversize")
+    except OSError as exc:
+        _log(f"copying job.tar failed ({exc!r})")
+        return _fail_pre_freshness("bad_manifest")
+    try:
+        _copy_capped(os.path.join(inbox, "job.tar.sig"), tmp_sig, _SIG_CAP_BYTES)
+    except _CopyOversize:
+        return _fail_pre_freshness("oversize")
+    except OSError:
+        # job.tar present but no readable .sig -> unsigned -> verify_failed.
+        return _fail_pre_freshness("verify_failed")
+    bg_present = os.path.exists(stick_bg)
+    if bg_present:
+        try:
+            _copy_capped(stick_bg, tmp_bg, _SIG_CAP_BYTES)
+        except _CopyOversize:
+            return _fail_pre_freshness("oversize")
+        except OSError:
+            # A present-but-unreadable break-glass sig: treat as absent (a
+            # privileged op then fails closed with cosign_failed at dispatch).
+            bg_present = False
+
+    # Step 4: verify the TMPFS copy against the box-local allowed_signers.
+    # CAPTURE the signer principal (previously discarded): it is threaded into
+    # every subsequent audit line as the identity that presented this job.
+    #
+    # Break-glass-ALONE recovery fallback. The normal path is
+    # the operator PRIMARY signature (tmp_sig) against allowed_signers. If that
+    # fails, the ONLY sanctioned fallback is a break-glass signature standing IN
+    # for a LOST primary: the SAME primary-slot signature (tmp_sig -- NOT the
+    # co-sign job.tar.bg.sig) is re-checked against the break-glass anchor. If
+    # THAT also fails, no box-local anchor vouches for these bytes ->
+    # verify_failed, and NOTHING is extracted (we never extract/dispatch a tar
+    # no anchor has authenticated -- the pre-existing "verify before extract"
+    # posture is preserved: extract only ever sees a tar authenticated by ONE
+    # of the two anchors). If it passes, the bytes are authenticated, but this
+    # is only PROVISIONAL: `bg_authorized` grants the job nothing yet. It is
+    # re-gated on the parsed operation below -- a break-glass-alone signature
+    # authorizes ONLY `rotate-job-signers` (the recovery/lockout path); ANY
+    # other operation is refused verify_failed after parse, before dispatch.
+    try:
+        principal = verify.verify(tmp_tar, tmp_sig, config.ALLOWED)
+        bg_authorized = False
+    except verify.VerifyError:
+        try:
+            principal = verify.verify_breakglass_primary(
+                tmp_tar, tmp_sig, config.BREAKGLASS
+            )
+        except verify.VerifyError as bg_exc:
+            # Neither the operator anchor nor the break-glass anchor
+            # authenticates these bytes -> verify_failed; principal null.
+            return _fail_pre_freshness(bg_exc.reason)  # verify_failed
+        bg_authorized = True
+
+    # Break-glass co-sign. ALWAYS a real bool. A present-but-invalid
+    # .bg.sig -> cosigned=False (dispatch fails a privileged op closed); a valid
+    # one -> True. NOTE: verify_cosign's real signature is 4 args
+    # (tar, bg_sig, breakglass, allowed) and returns None.
+    #
+    # A bg-authorized (break-glass-ALONE) job is NEVER co-signed: there is no
+    # primary signature to pair a co-signature with, and it may change only
+    # allowed_signers (which needs no co-sign). So cosign is neither computed
+    # nor relevant for it -- cosigned stays False (the `not bg_authorized`
+    # guard). For a normally operator-signed job (bg_authorized False) the
+    # existing co-sign path is entirely UNCHANGED.
+    cosigned = False
+    if bg_present and not bg_authorized:
+        try:
+            verify.verify_cosign(tmp_tar, tmp_bg, config.BREAKGLASS, config.ALLOWED)
+            cosigned = True
+        except verify.VerifyError:
+            cosigned = False
+
+    # Step 5: extract (hardened) + parse manifest + freshness.
+    extract_dir = _fresh_dir(os.path.join(TMPFS_DIR, "extract"))
+    try:
+        extract.extract(tmp_tar, extract_dir)
+    except extract.ExtractError as exc:
+        return _fail_pre_freshness(
+            _REASON_MAP.get(exc.reason, exc.reason), phase="extract",
+            principal=principal
+        )
+
+    payload_dir = os.path.join(extract_dir, "payload")
+    payload_names = set(os.listdir(payload_dir)) if os.path.isdir(payload_dir) else set()
+    try:
+        with open(os.path.join(extract_dir, "manifest.json"), "rb") as f:
+            manifest_bytes = f.read()
+    except OSError:
+        return _fail_pre_freshness("bad_manifest", phase="manifest",
+                                   principal=principal)
+    try:
+        parsed = manifest.parse(manifest_bytes, payload_names)
+    except manifest.ManifestError as exc:
+        return _fail_pre_freshness(exc.reason, phase="manifest",
+                                   principal=principal)
+
+    job = parsed["jobs"][0]
+    job_id = job["job_id"]
+    seq = parsed["seq"]
+    operation = job["operation"]
+    bundle_id = parsed.get("bundle_id")
+
+    # Break-glass-alone scope gate. A break-glass-ALONE authorization (bg_authorized, set
+    # above only when the operator-primary verify failed but the break-glass
+    # anchor authenticated the tar bytes) authorizes ONLY the recovery
+    # operation `rotate-job-signers`. For ANY other operation the break-glass-
+    # alone signature is NOT a valid authorization -> verify_failed, refused
+    # here BEFORE freshness/K1/dispatch, so nothing runs and no seq is consumed.
+    # The signer (a break-glass principal) is recorded on the audit line. A
+    # normally operator-signed job has bg_authorized False and is unaffected
+    # (this gate is a no-op for it -- EVERY other gate below is identical for a
+    # bg-authorized rotate-job-signers job: box/clock/seq/replay/K1/jobs==1).
+    if bg_authorized is True and operation != "rotate-job-signers":
+        # POST-verify (break-glass sig authenticated the bytes; the operation
+        # is simply outside break-glass scope) -> breadcrumb. reason reuses
+        # verify_failed but the breadcrumb's presence marks it "refused", not
+        # "forged" (see _fail_pre_freshness).
+        return _fail_pre_freshness("verify_failed", phase="manifest",
+                                   job_id=job_id, operation=operation,
+                                   principal=principal, seq=seq,
+                                   cosigned=cosigned, bundle_id=bundle_id)
+
+    now = _utcnow()
+    verdict = freshness.check(parsed, now.year, operation)
+    if verdict in ("wrong_box", "clock_insane", "stale_seq"):
+        return _fail_pre_freshness(verdict, phase="freshness", job_id=job_id,
+                                   operation=operation, principal=principal,
+                                   seq=seq, cosigned=cosigned, bundle_id=bundle_id)
+    if verdict == "replay":
+        return _replay(job_id, bundle_id, principal=principal,
+                       operation=operation, cosigned=cosigned)
+    # verdict == "fresh"
+
+    # dispatch needs a payload_dir even for a payload-less op (e.g. status).
+    if not os.path.isdir(payload_dir):
+        os.makedirs(payload_dir)
+
+    # Step 6: K1 gate.
+    led.set(led.READY)
+    if not button.await_press(config.K1_WINDOW_S):
+        return _no_confirmation(job_id, seq, bundle_id, now, principal=principal,
+                                operation=operation, cosigned=cosigned)
+    led.set(led.RUNNING)
+
+    # Step 7: dispatch. A returned int == the handler RAN (commit its outcome).
+    # A raised DispatchError == the handler was REFUSED before any exec
+    # (cosign_failed / dispatch's own bad_manifest|handler_failed): nothing ran,
+    # so it is LED-only and consumes no seq (see the module docstring).
+    out_dir = _fresh_dir(os.path.join(TMPFS_DIR, "out"))
+    started = _utcnow()
+    # Thread the manifest's monotonic `seq` onto the job dict BEFORE dispatch.
+    # `dispatch._write_job_json` serializes the
+    # WHOLE job dict into the vetted handler's job.json, so a handler that
+    # needs the seq -- e.g. `sign-hosts`, which records it into every
+    # allocation record as `causb.registry.reconcile()`'s deterministic
+    # ordering key -- reads it as `job["seq"]` with ZERO dispatch changes.
+    # The manifest schema keeps `seq` at the top level (never inside a job),
+    # so this ADDS the key rather than overwriting one. Safe to mutate `job`
+    # here: nothing below re-reads it in a way this disturbs
+    # (`_commit_and_deliver` takes explicit `job_id`/`seq` fields, not the
+    # dict), and every non-dispatch terminal (replay/no_confirmation) already
+    # returned above.
+    job["seq"] = seq
+    try:
+        rc = dispatch.run(operation, job, payload_dir, out_dir, cosigned,
+                          bg_authorized=bg_authorized)
+    except dispatch.DispatchError as exc:
+        _log(f"dispatch refused before exec: {exc.reason}")
+        return _fail_pre_freshness(exc.reason, phase="dispatch", job_id=job_id,
+                                   operation=operation, principal=principal,
+                                   seq=seq, cosigned=cosigned, bundle_id=bundle_id)
+
+    # Steps 8-10: commit (on-box first) then deliver then umount+LED.
+    return _commit_and_deliver(job_id, seq, bundle_id, rc, out_dir, started,
+                               principal=principal, operation=operation, cosigned=cosigned)
+
+
+# --------------------------------------------------------------------------
+# entry points
+# --------------------------------------------------------------------------
+
+
+def _run_locked(dev_path):
+    """The whole lifecycle, holding the flock. LED VERIFYING covers
+    mount+verify+extract+freshness; READY the K1 gate; RUNNING the
+    dispatch+commit+deliver; SAFE_REMOVE/ERROR the umounted terminal."""
+    led.set(led.VERIFYING)
+
+    # Step 1: pinned-vfat ro mount. A mount failure means nothing is mounted --
+    # LED ERROR, no umount to attempt.
+    os.makedirs(MNT_DIR, exist_ok=True)
+    try:
+        mountctl.mount_ro(dev_path, MNT_DIR)
+    except mountctl.MountError as exc:
+        _log(f"mount_ro failed: {exc.reason}")
+        # A stick that could not even be mounted is still an audited terminal --
+        # nothing is known about a job yet, so all fields are null
+        # but the mount_failed status is recorded.
+        _audit(job_id=None, operation=None, principal=None,
+               status=_status_error(exc.reason), seq=None)
+        led.set(led.ERROR)
+        return EXIT_OK
+
+    # From here the stick is mounted. Every normal terminal inside
+    # _process_mounted umounts + sets the held LED itself; the except arms are
+    # the fault net for anything that should NOT be a held-LED terminal.
+    try:
+        return _process_mounted()
+    except (button.ButtonError, led.LedError):
+        # Genuine device/hardware fault -> EXIT_FAULT (no sensible LED to
+        # hold). Umount first so the stick is not left mounted, then re-raise.
+        _best_effort_umount()
+        raise
+    except Exception as exc:  # noqa: BLE001 -- fail CLOSED on anything unforeseen
+        _log(f"unexpected failure, failing closed: {exc!r}")
+        return _finish(success=False)
+
+
+def run(dev_path):
+    """ExecStart= body. Acquire the global flock (contended -> BUSY LED, exit
+    0, touch no state) then run the full lifecycle under it. See the module
+    docstring for the exit-code contract."""
+    _log(f"invoked for {dev_path}")
+
+    lock_fd = _acquire_lock(LOCK_PATH)
+    if lock_fd is None:
+        _log("lock already held by another instance -- busy; touching no state")
+        led.set(led.BUSY)
+        return EXIT_OK
+
+    try:
+        return _run_locked(dev_path)
+    finally:
+        _release_lock(lock_fd)
+
+
+def main(argv):
+    if len(argv) == 2 and argv[1] == "--cleanup":
+        return cleanup()
+
+    if len(argv) == 2 and argv[1] == "--reconcile":
+        return reconcile()
+
+    if len(argv) != 2:
+        _log(f"usage: {argv[0]} /dev/<partition>  |  {argv[0]} --reconcile  |  {argv[0]} --cleanup")
+        return EXIT_FAULT
+
+    try:
+        return run(argv[1])
+    except (button.ButtonError, led.LedError) as exc:
+        _log(f"fault: {exc.reason}")
+        return EXIT_FAULT
+    except OSError as exc:
+        _log(f"fault: {exc}")
+        return EXIT_FAULT
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

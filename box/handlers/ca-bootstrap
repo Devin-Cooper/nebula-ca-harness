@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""box/handlers/ca-bootstrap -- the "ca-bootstrap" vetted handler. This is
+the FIRST post-air-gap job the
+operator ever runs: it mints the CA's ca.key/ca.crt pair ON THE BOX via
+`nebula-cert ca` (through `causb.nebulacli.ca`) -- the key is BORN here and
+must NEVER leave (it is the one artifact this whole harness exists to
+protect). A standalone, extensionless script (like box/handlers/status
+before it), installed to `config.HANDLERS_DIR` (or run straight out of a
+repo checkout's `box/handlers/`) and invoked by `causb.dispatch` as
+`ca-bootstrap <job.json> <payload_dir> <out_dir>` -- the same uniform
+vetted-handler argv contract every other handler gets. `job.json` here is
+`causb.manifest.parse()`'s single `jobs[0]` dict (job_id/operation/args/
+payload), NOT the full manifest wrapper -- see `causb.dispatch._write_job_json`,
+which serializes exactly that one job dict for every vetted handler's
+argv[1].
+
+**The CA MUST be v1.** The real
+`nebula-cert ca` CLI silently DEFAULTS to `-version 2` if `-version` is
+omitted, and `causb.nebulacli.ca()` deliberately takes `version` as a bare
+pass-through with NO internal default of its own (unlike `sign()`, which
+hardcodes `-version 1`). A v2 CA would silently break the mixed/Android
+fleet this mesh serves. `_CA_VERSION = "1"` below is therefore ALWAYS passed
+explicitly -- never inferred, never left to nebula-cert's own default --
+and the test suite asserts this exact call shape directly.
+
+**Idempotency is the primary safety property (behavior step 1).** A CA,
+once minted, cannot be silently regenerated: every cert this box will ever
+sign is only valid against THIS ca.crt, so a second bootstrap must refuse,
+not clobber. The guard is a single, first-checked `os.path.exists(ca.key)`
+-- deliberately checked BEFORE anything else (parsing args, touching
+ca_dir) so an already-bootstrapped box's `run()` call is a true no-op on
+every path: nothing is read from the manifest, nothing is written anywhere.
+
+**Ordering invariant: "ca.key exists" implies "the bootstrap is fully
+complete."** The spec's own step order is nebula-cert -> place -> write
+registry.json -> copy to out_dir. This module deliberately reorders the
+LAST two internal steps so that registry.json and the out_dir copies are
+written FIRST (from the not-yet-renamed tmp cert -- identical bytes, so
+this is invisible to any caller) and the two `os.replace()` renames that
+actually create `ca.key`/`ca.crt` at their FINAL path happen LAST, with
+`ca.crt` renamed before `ca.key`. This is not what the spec's prose lists
+step-by-step, but it is observably identical for every success path (the
+end state after a successful run() is exactly the same file layout either
+way) and it closes a real gap the literal order leaves open: if the literal
+order's registry.save() or out_dir copy failed AFTER ca.key had already
+been placed at its final path, the box would be permanently wedged --
+`ca.key` exists (so every future run refuses as already_bootstrapped) but
+`registry.json`/out_dir were never written, with no way to retry. Under
+this module's actual order, ANY failure after nebula-cert succeeds (a
+chmod, registry.save, an out_dir copy, or a rename itself) is caught by one
+enclosing try/except that removes every tmp AND final-path artifact this
+attempt might have created, so `ca.key` never exists unless the ENTIRE
+bootstrap (including registry.json + out_dir) already succeeded -- a retry
+after any such failure starts completely clean. `tests/unit/
+test_handler_ca_bootstrap.py`'s `TestWriteFailureLeavesNoWedge` proves this
+directly (an out_dir-copy failure, then a clean successful retry).
+
+**Fail-closed via temp names (behavior's closing note).** `nebula-cert`
+writes straight to whatever `-out-crt`/`-out-key` paths it is given; this
+module always points those at `ca.crt.tmp`/`ca.key.tmp` inside `ca_dir`
+(mirrors `causb.commitlog`/`causb.registry`'s own `<final>.tmp` atomic-write
+convention) so a `NebulaError` (nonzero exit, timeout, missing binary) never
+leaves a truncated or partial file at the FINAL `ca.crt`/`ca.key` path --
+only ever at the `.tmp` name, which is unlinked on that path.
+
+**Durability.** The tmp key/cert files are fsync'd before being chmod'd and
+renamed into place, and `ca_dir` itself is fsync'd once both renames
+succeed -- mirroring `causb.registry.save`'s own fsync-before-rename +
+fsync-the-directory pattern (this project's established durable-write idiom
+for exactly this class of artifact). `_fsync_dir` below is a verbatim,
+deliberately-duplicated copy of `causb.registry._fsync_dir`/
+`causb.commitlog._fsync_dir` -- each module's on-disk-durability helper
+stays self-contained, per this project's established convention (see
+`causb/registry.py`'s own docstring for the rationale).
+
+**Modes and ownership (behavior step 3).** `ca.key` 0400, `ca.crt` 0444,
+`ca_dir` 0700 are set EXPLICITLY (never relied upon via umask) by chmod'ing
+the tmp files before the rename that creates the final path -- `os.replace`
+preserves the source inode's mode bits across a same-filesystem rename, so
+there is never a window where the final path exists with the wrong mode.
+`ca_dir` is chmod'd to 0700 immediately after it is created/confirmed to
+exist, BEFORE any key material is ever written into it. Ownership
+(root:root) is attempted via `os.chown` as a best-effort LAST step, wrapped
+so a `PermissionError` (this handler running non-root, e.g. under test, or
+a local dev invocation) does not fail the bootstrap -- the explicit chmod
+modes above are the real access-control gate; chown is defense-in-depth on
+top, not load-bearing on its own.
+
+**args validation is this handler's OWN job (mirrors `causb.dispatch`'s own
+documented stance on `args`).** `causb.manifest.parse()` places NO
+restriction at all on `job["args"]`'s shape -- exactly like `dispatch.py`'s
+`args.privileged` -- so this handler treats a non-dict `args` as empty
+(all defaults apply) rather than crashing, and additionally rejects a
+control character (NUL, C0, DEL) in `overlay`/`duration`/`name` as
+`bad_manifest` before ever calling `nebula_ca`: without that check, a
+manifest with e.g. an embedded NUL in `args.name` would reach
+`causb.nebulacli.ca()`'s own `_check_clean()`, which raises a bare
+`ValueError` (a caller-bug signal, not `NebulaError`) that would otherwise
+escape this handler's bounded exit-code contract entirely.
+
+**Exit codes / reason vocabulary.** `EXIT_OK` (0), `EXIT_FAULT` (1 -- CLI-
+invocation misuse, i.e. wrong argc; should be unreachable in production
+since `causb.dispatch` always supplies the fixed 4-element argv),
+`EXIT_BAD_MANIFEST` (2), `EXIT_ALREADY_BOOTSTRAPPED` (3 -- pinned by the
+spec exactly), `EXIT_NEBULA_FAILED` (4), `EXIT_WRITE_FAILED` (5); the
+harness's own contract only cares that a failure exits nonzero (any handler
+exit != 0 maps to `handler_failed` at the dispatch layer), so only 3's
+specific value is a real wire contract -- the others are simply kept small,
+distinct, and documented for anyone reading a log.
+"""
+
+import json
+import os
+import shutil
+import sys
+
+# APPEND (not insert(0)) the installed package dir: in production nothing
+# else on sys.path provides `causb`, so the appended /usr/local/lib is where
+# it is found; but an EXPLICIT `PYTHONPATH` (e.g. a source checkout's
+# box/lib, as the on-box test runner sets, or this repo's own unit tests)
+# must be honoured rather than silently shadowed by a possibly-STALE
+# installed copy. Mirrors box/bin/ca-usb-run's identical, deliberately-
+# reasoned choice (see that file's own comment) rather than
+# box/handlers/status's older `insert(0, ...)`.
+sys.path.append("/usr/local/lib")
+
+from causb import config, nebulacli, registry  # noqa: E402  (see sys.path.append above)
+
+EXIT_OK = 0
+EXIT_FAULT = 1  # CLI-invocation misuse (wrong argc) -- mirrors status.py's
+                # EXIT_FAULT; should never happen in production, since
+                # causb.dispatch always supplies the fixed 4-element argv.
+EXIT_BAD_MANIFEST = 2
+EXIT_ALREADY_BOOTSTRAPPED = 3
+EXIT_NEBULA_FAILED = 4
+EXIT_WRITE_FAILED = 5
+
+_REASON_BY_EXIT = {
+    EXIT_FAULT: "fault",
+    EXIT_BAD_MANIFEST: "bad_manifest",
+    EXIT_ALREADY_BOOTSTRAPPED: "already_bootstrapped",
+    EXIT_NEBULA_FAILED: "nebula_failed",
+    EXIT_WRITE_FAILED: "write_failed",
+}
+
+_DEFAULT_CA_NAME = "nebula-ca"
+_CA_CURVE = "25519"
+# ALWAYS explicit. See module docstring. Not caller-configurable: a
+# job manifest may override name/duration/overlay, but never the CA's wire
+# cert version.
+_CA_VERSION = "1"
+
+
+def _is_clean_str(value):
+    """True if `value` is a string containing no control character (NUL,
+    C0 0x00-0x1f, or DEL 0x7f) -- the same conservative check
+    `causb.manifest`/`causb.dispatch`/`causb.nebulacli` all apply to
+    manifest-derived data that will flow into a subprocess argv or a
+    written file. See module docstring's "args validation" section for why
+    this handler needs its own copy of it."""
+    if not isinstance(value, str):
+        return False
+    return not any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in value)
+
+
+def _fsync_dir(path):
+    """Verbatim copy of causb.registry._fsync_dir / causb.commitlog
+    ._fsync_dir (see module docstring: each module's durable-write helper
+    stays local/self-contained, not imported, per this project's established
+    convention)."""
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_file(path):
+    """fsync a regular file's data by path -- valid even via a fresh
+    read-only fd, since fsync operates on the underlying inode/data,
+    independent of which fd or mode was used to open it."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _silent_remove(*paths):
+    """Best-effort unlink of every path in `paths`, ignoring any that don't
+    exist or can't be removed -- used to restore "nothing was written" on
+    every failure branch below (module docstring's ordering invariant)."""
+    for p in paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def run(job, payload_dir, out_dir, *, ca_dir=config.CA_DIR,
+        registry_path=config.REGISTRY, nebula_ca=nebulacli.ca):
+    """Handler entrypoint body (behavior steps 1-6). `payload_dir` is
+    accepted, unused, purely for argv-contract uniformity with every other
+    vetted handler (mirrors box/handlers/status's identical `del`) --
+    ca-bootstrap needs no job payload file. `ca_dir`/`registry_path`/
+    `nebula_ca` are DI seams (mirrors this project's established
+    `causb.mountctl`-style injectable-runner convention): production calls
+    (the `__main__` shim below) use the real `config.CA_DIR`/
+    `config.REGISTRY`/`causb.nebulacli.ca`; tests point all three at
+    tmpdirs + a fake recorder.
+
+    Returns one of the `EXIT_*` codes above; never raises for any
+    foreseeable failure (NebulaError, OSError) -- see module docstring.
+    """
+    del payload_dir  # contract uniformity only; see docstring
+
+    ca_key_path = os.path.join(ca_dir, "ca.key")
+    ca_crt_path = os.path.join(ca_dir, "ca.crt")
+
+    # 1. Idempotency guard -- FIRST, before anything else is read or
+    # touched. See module docstring's "Idempotency is the primary safety
+    # property" section.
+    if os.path.exists(ca_key_path):
+        return EXIT_ALREADY_BOOTSTRAPPED
+
+    # 2. Manifest args -- job.json is the single job dict (job_id/operation/
+    # args/payload), NOT the full manifest wrapper (see module docstring).
+    # args itself is entirely unvalidated upstream (causb.manifest.parse()
+    # never inspects it) -- a non-dict args is treated as empty (every field
+    # then falls back to its config-sourced default) rather than crashing.
+    args = job.get("args")
+    if not isinstance(args, dict):
+        args = {}
+    overlay = args.get("overlay", config.OVERLAY_CIDR)
+    duration = args.get("duration", config.CA_DURATION)
+    name = args.get("name", _DEFAULT_CA_NAME)
+    if not (_is_clean_str(overlay) and _is_clean_str(duration) and _is_clean_str(name)):
+        return EXIT_BAD_MANIFEST
+
+    tmp_crt = ca_crt_path + ".tmp"
+    tmp_key = ca_key_path + ".tmp"
+
+    try:
+        os.makedirs(ca_dir, exist_ok=True)
+        # Explicit mode, set BEFORE any key material is ever written into
+        # ca_dir (module docstring's "Modes and ownership" section).
+        os.chmod(ca_dir, 0o700)
+    except OSError:
+        return EXIT_WRITE_FAILED
+
+    try:
+        nebula_ca(name, _CA_CURVE, _CA_VERSION, duration, out_crt=tmp_crt, out_key=tmp_key)
+    except nebulacli.NebulaError:
+        _silent_remove(tmp_crt, tmp_key)
+        return EXIT_NEBULA_FAILED
+
+    # From here on, ANY OSError (chmod/fsync/registry.save/shutil.copyfile/
+    # os.replace) is fail-closed the same way: remove every tmp AND
+    # final-path artifact this attempt might have created, so a retry sees
+    # a completely clean ca_dir (module docstring's ordering invariant).
+    try:
+        _fsync_file(tmp_key)
+        _fsync_file(tmp_crt)
+        os.chmod(tmp_key, 0o400)
+        os.chmod(tmp_crt, 0o444)
+
+        reg = {"overlay_cidr": overlay, "hosts": {}}
+        registry.save(reg, registry_path)
+
+        # Copy PUBLIC artifacts to out_dir from the (still tmp-named, but
+        # byte-identical) cert and the just-saved registry -- an explicit,
+        # two-name allowlist copy, never a directory sweep, so ca.key can
+        # never reach out_dir by construction (module docstring / spec's
+        # mutation-proof requirement). NEVER copy tmp_key/ca_key_path
+        # anywhere near out_dir.
+        shutil.copyfile(tmp_crt, os.path.join(out_dir, "ca.crt"))
+        shutil.copyfile(registry_path, os.path.join(out_dir, "registry.json"))
+
+        # Commit point: crt THEN key, key LAST. "ca.key exists" is the ONLY
+        # thing the idempotency guard checks, so it must never become true
+        # until everything else above has already durably succeeded.
+        os.replace(tmp_crt, ca_crt_path)
+        os.replace(tmp_key, ca_key_path)
+        _fsync_dir(ca_dir)
+    except OSError:
+        _silent_remove(tmp_crt, tmp_key, ca_crt_path, ca_key_path)
+        return EXIT_WRITE_FAILED
+
+    # Best-effort root:root ownership (behavior step 3). Not wrapped around
+    # the fail-closed block above: by this point the bootstrap has already
+    # fully succeeded (mode bits are the real access-control gate; see
+    # module docstring), so a chown failure (running non-root, e.g. under
+    # test) must NOT undo an otherwise-complete bootstrap.
+    for p in (ca_dir, ca_crt_path, ca_key_path):
+        try:
+            os.chown(p, 0, 0)
+        except OSError:
+            pass
+
+    return EXIT_OK
+
+
+def main(argv):
+    if len(argv) != 4:
+        print(f"usage: {argv[0]} <job.json> <payload_dir> <out_dir>", file=sys.stderr)
+        return EXIT_FAULT
+    _, job_path, payload_dir, out_dir = argv
+
+    try:
+        with open(job_path, "rb") as f:
+            job = json.loads(f.read())
+    except (OSError, ValueError):
+        print("ca-bootstrap: bad_manifest", file=sys.stderr)
+        return EXIT_BAD_MANIFEST
+    if not isinstance(job, dict):
+        print("ca-bootstrap: bad_manifest", file=sys.stderr)
+        return EXIT_BAD_MANIFEST
+
+    try:
+        rc = run(job, payload_dir, out_dir)
+    except OSError as exc:
+        # Mirrors box/handlers/status's identical outer safety net: run()
+        # is designed to catch every foreseeable OSError itself, so this is
+        # belt-and-suspenders, not the primary contract.
+        print(f"ca-bootstrap: fault: {exc}", file=sys.stderr)
+        return EXIT_WRITE_FAILED
+
+    if rc != EXIT_OK:
+        print(f"ca-bootstrap: {_REASON_BY_EXIT.get(rc, 'fault')}", file=sys.stderr)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

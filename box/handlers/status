@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""box/handlers/status -- the "status" vetted handler.
+
+A standalone, extensionless script (like `box/bin/ca-usb-run` and `mac/caj`/
+`mac/caj-recv` before it -- see `tests/unit/test_ca_usb_run.py`'s docstring
+for the precedent), installed to `config.HANDLERS_DIR` (or run straight out
+of a repo checkout's `box/handlers/`) and invoked by `causb.dispatch` as
+`status <job.json> <payload_dir> <out_dir>` -- the same uniform vetted-
+handler argv contract every other handler gets, even though this handler
+needs neither its own job's args nor any payload file: it reports BOX-WIDE
+state, not anything from the job that happened to trigger it.
+
+**What it writes to `out_dir`:**
+- `box-info.json` -- the exact 9-field shape: `box`, `bootstrapped`,
+  `ca_fingerprint`, `nebula_cert_version`, `curve`, `overlay_cidr`, `seq`,
+  `schema_versions`, `rtc_ok`.
+- `registry.json` -- the box's REAL, OBJECT-shaped registry
+  (`causb.registry`'s own on-disk `{"overlay_cidr", "hosts"}` shape -- see
+  that module's docstring), read via `causb.registry.load()`, or that same
+  module's empty-registry default (`{"overlay_cidr": config.OVERLAY_CIDR,
+  "hosts": {}}`) for a box `ca-bootstrap` has never run on yet. **Read-only:**
+  this handler mirrors the on-disk registry, it never writes CA_DIR. (This
+  used to be a stale `[]` literal, shipped before
+  `ca-bootstrap`/`sign-hosts` existed to populate the real shape -- which
+  meant running `status` after `sign-hosts` clobbered the operator's
+  populated registry.json mirror with an empty array on their next stick
+  round-trip. Corrected here to echo the real object instead.)
+- `health.json` -- a DISTINCT small diagnostic object. **Judgment call:**
+  the spec's line ("export registry.json +
+  box-info.json (incl. rtc_ok) + health to outbox") lists three things, but
+  `box-info.json`'s own schema is a FIXED 9-field shape with no room
+  for e.g. disk-free space -- which the spec separately requires this
+  handler to read ("Reads ... disk free ..."). Rather than either silently
+  dropping disk-free or smuggling a 10th field into box-info.json's fixed
+  wire shape, this handler treats "+ health" as a genuinely separate file
+  and puts every diagnostic signal that isn't one of the 9 named fields
+  there instead: disk space, and (duplicated, for a human glancing at only
+  this file) `rtc_ok`/whether `nebula-cert` itself is reachable at all.
+
+**`schema_versions` -- also a judgment call.** Never defined further by the
+spec beyond appearing as a bare field name. This handler reports
+`{"manifest": 1, "status": 1}` -- the two wire-format versions this box's
+harness currently understands (manifest `schema_version` is pinned at 1;
+`status.json` carries an analogous `schema_version` field, also 1
+today). Plural "versions" strongly implies more than one schema is being
+reported on, and these are the only two this codebase defines.
+
+**`bootstrapped`/CA-field scope.** `bootstrapped` is computed for real (`os
+.path.isfile(CA_DIR/ca.crt)`). Now that `ca-bootstrap`/`sign-hosts` exist
+(this paragraph used to flag their absence as the reason the three fields
+below stayed unconditionally `None` -- that follow-on has landed), each is
+populated whenever `bootstrapped` is `True`:
+  - `curve` is always `"25519"` -- the CA's one fixed curve; `ca-bootstrap`
+    never mints any other.
+  - `overlay_cidr` comes from `causb.registry.load()`'s own `overlay_cidr`
+    field -- the authoritative value `ca-bootstrap` fixed at mint time (or
+    the module's own empty-registry default if `registry.json` is somehow
+    absent/corrupt on an otherwise-bootstrapped box).
+  - `ca_fingerprint` is extracted by REUSING `causb.recovery._ca_fingerprint`
+    verbatim (same `nebula-cert print -json` invocation, same fingerprint
+    field, same try/except-degrade-to-`None`, same timeout) rather than a
+    second, divergent parsing strategy -- so this box-info builder and
+    `causb.recovery`'s own box-info builder can never drift apart on how a
+    fingerprint is read.
+Any failure in the above (a corrupt registry.json, a missing/unparseable
+`nebula-cert`) degrades ONLY that field to `None` -- graceful, never a
+crash. Pre-bootstrap, all three still stay `None`, exactly as before.
+
+**`rtc_ok` reuses `causb.freshness.clock_sane()`** (the same "year >= 2026"
+plausibility gate that decides whether to run a job at all) against
+the RTC's OWN idea of the current year, read from `/sys/class/rtc/rtc0/
+since_epoch` (a plain integer Unix timestamp -- simpler and, per the spec's
+own "hwclock -r OR /sys/class/rtc" wording, an equally valid choice
+to the `hwclock` CLI, and one that needs no subprocess at all). `rtc_ok`
+is `False` if the RTC can't be read OR its year looks implausible --
+either way, "not a clock an operator should trust right now."
+
+Every real-system read (`nebula-cert -version`, the RTC sysfs path, the
+disk-usage target directory, the seq-state directory, `registry.json`, and
+-- once bootstrapped -- `nebula-cert print -json`'s PATH lookup) is threaded
+through as an explicit keyword argument on `build_box_info()`/
+`build_health()`, so `tests/unit/test_status_handler.py` can point every one
+of them at a fake without needing root or this exact box's hardware --
+mirrors this project's established `causb.mountctl`-style injectable-seam
+convention.
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+sys.path.insert(0, "/usr/local/lib")
+
+from causb import config, freshness, recovery, registry  # noqa: E402  (see sys.path.insert above)
+
+EXIT_OK = 0
+EXIT_FAULT = 1
+
+RTC_SINCE_EPOCH_PATH = "/sys/class/rtc/rtc0/since_epoch"
+# Single source of truth lives in causb.config (shared with causb.recovery's
+# box-info.json), not a local literal that could drift.
+SCHEMA_VERSIONS = config.SCHEMA_VERSIONS
+# The CA's one fixed curve (mirrors ca-bootstrap._CA_CURVE / causb.recovery's
+# own inline "25519" literal -- each module keeps its own copy, per this
+# project's established self-contained-duplication convention; see
+# causb/registry.py's docstring for the rationale).
+_CA_CURVE = "25519"
+
+
+def _read_seq(state_dir):
+    """Mirrors causb.freshness._last_seq()/causb.commitlog._read_seq()
+    exactly; duplicated (not imported) per this project's established
+    convention of keeping each module's on-disk-format assumptions local
+    and self-contained (see causb/commitlog.py's own docstring)."""
+    try:
+        with open(os.path.join(state_dir, "seq")) as f:
+            return int(f.read().strip())
+    except FileNotFoundError:
+        return 0
+
+
+def _rtc_year(rtc_path):
+    """The RTC's own idea of the current year, or None if it can't be read
+    (missing sysfs node, garbage content) -- None means "unknown", folded
+    into rtc_ok=False by the caller, never crashes the whole handler."""
+    try:
+        with open(rtc_path) as f:
+            epoch = int(f.read().strip())
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).year
+
+
+def _rtc_ok(rtc_path):
+    year = _rtc_year(rtc_path)
+    return year is not None and freshness.clock_sane(year)
+
+
+def _nebula_cert_version(runner, nebula_cert_bin):
+    """The version string nebula-cert reports (e.g. "1.10.3"), or None if
+    the binary is missing/unreachable/times out, or its output doesn't
+    match the expected "Version: <x>" shape -- never raises."""
+    try:
+        result = runner(
+            [nebula_cert_bin, "-version"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    text = result.stdout.decode(errors="replace") if result.stdout else ""
+    m = re.search(r"Version:\s*(\S+)", text)
+    return m.group(1) if m else None
+
+
+def _is_bootstrapped(ca_dir):
+    return os.path.isfile(os.path.join(ca_dir, "ca.crt"))
+
+
+def _read_registry(ca_dir):
+    """The registry.json OBJECT this handler reads (never writes -- status
+    is read-only): `causb.registry`'s own `{"overlay_cidr", "hosts"}`
+    on-disk shape (see that module's docstring). Reuses
+    `causb.registry.load()`, which already returns the correct
+    empty-registry default for a box that has never run `ca-bootstrap`
+    (`FileNotFoundError`) -- so this handler never reimplements that shape.
+    A CORRUPT on-disk file (`RegistryError`) degrades to that SAME default
+    rather than raising: unlike a CA-mutating handler (e.g. `sign-hosts`),
+    `status` must never crash or fail closed over something it only ever
+    reports on, never writes."""
+    try:
+        return registry.load(os.path.join(ca_dir, "registry.json"))
+    except registry.RegistryError:
+        return {"overlay_cidr": config.OVERLAY_CIDR, "hosts": {}}
+
+
+def _disk_usage(path):
+    """(total_bytes, free_bytes) for the filesystem holding `path`, or
+    (None, None) if it can't be statted (e.g. path doesn't exist yet)."""
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError:
+        return None, None
+    return usage.total, usage.free
+
+
+def build_box_info(*, box_name, state_dir, ca_dir, rtc_path,
+                    nebula_cert_runner=subprocess.run, nebula_cert_bin="nebula-cert",
+                    nebula_cert_path=None):
+    """The exact box-info.json shape. See module docstring for the
+    bootstrapped-scope and schema_versions judgment calls.
+
+    `nebula_cert_path` is a PATH-search-string override (mirrors
+    `causb.recovery._ca_fingerprint`'s own `path=` seam, threaded straight
+    through to it) -- NOT a filesystem path -- used only to resolve the
+    `nebula-cert` binary for the post-bootstrap fingerprint read; `None`
+    (the default) means "search the real PATH", correct in production."""
+    bootstrapped = _is_bootstrapped(ca_dir)
+    curve = None
+    overlay_cidr = None
+    ca_fingerprint = None
+    if bootstrapped:
+        curve = _CA_CURVE
+        overlay_cidr = _read_registry(ca_dir).get("overlay_cidr")
+        # REUSE causb.recovery's exact fingerprint extraction (same
+        # nebula-cert invocation, same fingerprint field, same
+        # try/except-degrade-to-None, same timeout) rather than a second,
+        # divergent parsing strategy -- see module docstring.
+        ca_fingerprint = recovery._ca_fingerprint(
+            os.path.join(ca_dir, "ca.crt"),
+            run=nebula_cert_runner,
+            path=nebula_cert_path,
+        )
+    return {
+        "box": box_name,
+        "bootstrapped": bootstrapped,
+        "ca_fingerprint": ca_fingerprint,
+        "nebula_cert_version": _nebula_cert_version(nebula_cert_runner, nebula_cert_bin),
+        "curve": curve,
+        "overlay_cidr": overlay_cidr,
+        "seq": _read_seq(state_dir),
+        "schema_versions": dict(SCHEMA_VERSIONS),
+        "rtc_ok": _rtc_ok(rtc_path),
+    }
+
+
+def build_health(*, state_dir, rtc_path,
+                  nebula_cert_runner=subprocess.run, nebula_cert_bin="nebula-cert"):
+    """The "+ health" summary (see module docstring): whatever diagnostic
+    signal isn't one of box-info.json's fixed 9 fields -- currently disk
+    space for STATE_DIR's filesystem, plus rtc_ok/nebula-cert-reachability
+    duplicated for a human reading only this file."""
+    disk_total, disk_free = _disk_usage(state_dir)
+    return {
+        "rtc_ok": _rtc_ok(rtc_path),
+        "nebula_cert_reachable": _nebula_cert_version(nebula_cert_runner, nebula_cert_bin) is not None,
+        "disk_total_bytes": disk_total,
+        "disk_free_bytes": disk_free,
+    }
+
+
+def _atomic_write_json(dest_dir, name, obj):
+    """tmp -> rename, mirroring this project's established atomic-write
+    idiom (causb.commitlog, mac/caj, mac/caj-recv, install.sh) -- a reader
+    (or a concurrent run of this handler, however unlikely) never observes
+    a partially-written file."""
+    path = os.path.join(dest_dir, name)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def run(manifest_path, payload_dir, out_dir):
+    """Handler entrypoint body. `manifest_path`/`payload_dir` are
+    accepted, unused, purely for argv-contract uniformity with every other
+    vetted handler -- status reports box-wide state, never anything from
+    the triggering job's own args/payload."""
+    del manifest_path, payload_dir  # contract uniformity only; see docstring
+
+    box_info = build_box_info(
+        box_name=config.BOX_NAME, state_dir=config.STATE_DIR, ca_dir=config.CA_DIR,
+        rtc_path=RTC_SINCE_EPOCH_PATH,
+    )
+    _atomic_write_json(out_dir, "box-info.json", box_info)
+    _atomic_write_json(out_dir, "registry.json", _read_registry(config.CA_DIR))
+    _atomic_write_json(
+        out_dir, "health.json",
+        build_health(state_dir=config.STATE_DIR, rtc_path=RTC_SINCE_EPOCH_PATH),
+    )
+    return EXIT_OK
+
+
+def main(argv):
+    if len(argv) != 4:
+        print(f"usage: {argv[0]} <manifest.json> <payload_dir> <out_dir>", file=sys.stderr)
+        return EXIT_FAULT
+    _, manifest_path, payload_dir, out_dir = argv
+    try:
+        return run(manifest_path, payload_dir, out_dir)
+    except OSError as exc:
+        print(f"status: fault: {exc}", file=sys.stderr)
+        return EXIT_FAULT
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

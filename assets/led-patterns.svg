@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 690" width="940" height="690" font-family="Helvetica,Arial,sans-serif">
+<rect x="0" y="0" width="940" height="690" fill="#ffffff"/>
+<rect x="4" y="4" width="932" height="682" rx="18" fill="none" stroke="#cbd5e1" stroke-width="2"/>
+<defs><radialGradient id="led" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#4ade80"/><stop offset="60%" stop-color="#16a34a"/><stop offset="100%" stop-color="#15803d"/></radialGradient></defs>
+<text x="28" y="52" font-size="30" font-weight="bold" fill="#0f172a">Status LED &#8212; <tspan fill="#16a34a">user_led</tspan> (green)</text>
+<text x="28" y="84" font-size="18" fill="#64748b">The box is headless: one green LED, read by its blink <tspan font-weight="bold">rhythm</tspan>. Strip = a 2-second window.</text>
+<line x1="28" y1="112" x2="912" y2="112" stroke="#cbd5e1" stroke-width="2"/>
+<text x="70" y="134" font-size="14" font-weight="bold" fill="#64748b" letter-spacing="1">STATE</text>
+<text x="300" y="134" font-size="14" font-weight="bold" fill="#64748b" letter-spacing="1">BLINK PATTERN</text>
+<text x="624" y="134" font-size="14" font-weight="bold" fill="#64748b" letter-spacing="1">MEANING</text>
+<circle cx="52" cy="172" r="13" fill="url(#led)"/>
+<circle cx="52" cy="172" r="13" fill="none" stroke="#15803d" stroke-width="1"/>
+<text x="78" y="170" font-size="21" font-weight="bold" fill="#0f172a">VERIFYING</text>
+<text x="78" y="190" font-size="14" fill="#64748b">330 ms</text>
+<rect x="300" y="150" width="300" height="44" rx="5" fill="#e2e8f0"/><rect x="300.0" y="150" width="49.5" height="44" fill="#16a34a"/><rect x="399.0" y="150" width="49.5" height="44" fill="#16a34a"/><rect x="498.0" y="150" width="49.5" height="44" fill="#16a34a"/><rect x="597.0" y="150" width="3.0" height="44" fill="#16a34a"/><rect x="300" y="150" width="300" height="44" rx="5" fill="none" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="624" y="170" font-size="17" fill="#0f172a">Checking the signed job</text>
+<text x="624" y="190" font-size="15" font-weight="bold" fill="#64748b">wait</text>
+<line x1="28" y1="216" x2="912" y2="216" stroke="#eef2f6" stroke-width="1"/>
+<circle cx="52" cy="246" r="13" fill="url(#led)"/>
+<circle cx="52" cy="246" r="13" fill="none" stroke="#15803d" stroke-width="1"/>
+<text x="78" y="244" font-size="21" font-weight="bold" fill="#0f172a">READY</text>
+<text x="78" y="264" font-size="14" fill="#64748b">125 ms</text>
+<rect x="300" y="224" width="300" height="44" rx="5" fill="#e2e8f0"/><rect x="300.0" y="224" width="18.8" height="44" fill="#16a34a"/><rect x="337.5" y="224" width="18.8" height="44" fill="#16a34a"/><rect x="375.0" y="224" width="18.8" height="44" fill="#16a34a"/><rect x="412.5" y="224" width="18.8" height="44" fill="#16a34a"/><rect x="450.0" y="224" width="18.8" height="44" fill="#16a34a"/><rect x="487.5" y="224" width="18.8" height="44" fill="#16a34a"/><rect x="525.0" y="224" width="18.8" height="44" fill="#16a34a"/><rect x="562.5" y="224" width="18.8" height="44" fill="#16a34a"/><rect x="300" y="224" width="300" height="44" rx="5" fill="none" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="624" y="244" font-size="17" fill="#0f172a">Waiting for your confirmation</text>
+<text x="624" y="264" font-size="15" font-weight="bold" fill="#16a34a">▶ PRESS K1</text>
+<line x1="28" y1="290" x2="912" y2="290" stroke="#eef2f6" stroke-width="1"/>
+<circle cx="52" cy="320" r="13" fill="url(#led)"/>
+<circle cx="52" cy="320" r="13" fill="none" stroke="#15803d" stroke-width="1"/>
+<text x="78" y="318" font-size="21" font-weight="bold" fill="#0f172a">RUNNING</text>
+<text x="78" y="338" font-size="14" fill="#64748b">solid</text>
+<rect x="300" y="298" width="300" height="44" rx="5" fill="#e2e8f0"/><rect x="300" y="298" width="300" height="44" rx="5" fill="#16a34a"/><rect x="300" y="298" width="300" height="44" rx="5" fill="none" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="624" y="318" font-size="17" fill="#0f172a">Running the operation</text>
+<text x="624" y="338" font-size="15" font-weight="bold" fill="#64748b">wait</text>
+<line x1="28" y1="364" x2="912" y2="364" stroke="#eef2f6" stroke-width="1"/>
+<circle cx="52" cy="394" r="13" fill="url(#led)"/>
+<circle cx="52" cy="394" r="13" fill="none" stroke="#15803d" stroke-width="1"/>
+<text x="78" y="392" font-size="21" font-weight="bold" fill="#0f172a">SAFE-REMOVE</text>
+<text x="78" y="412" font-size="14" fill="#64748b">1000 ms</text>
+<rect x="300" y="372" width="300" height="44" rx="5" fill="#e2e8f0"/><rect x="300.0" y="372" width="150.0" height="44" fill="#16a34a"/><rect x="300" y="372" width="300" height="44" rx="5" fill="none" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="624" y="392" font-size="17" fill="#0f172a">Done — committed, delivered</text>
+<text x="624" y="412" font-size="15" font-weight="bold" fill="#16a34a">pull the stick</text>
+<line x1="28" y1="438" x2="912" y2="438" stroke="#eef2f6" stroke-width="1"/>
+<circle cx="52" cy="468" r="13" fill="url(#led)"/>
+<circle cx="52" cy="468" r="13" fill="none" stroke="#15803d" stroke-width="1"/>
+<text x="78" y="466" font-size="21" font-weight="bold" fill="#0f172a">ERROR</text>
+<text x="78" y="486" font-size="14" fill="#64748b">50 ms</text>
+<rect x="300" y="446" width="300" height="44" rx="5" fill="#e2e8f0"/><rect x="300.0" y="446" width="7.5" height="44" fill="#16a34a"/><rect x="315.0" y="446" width="7.5" height="44" fill="#16a34a"/><rect x="330.0" y="446" width="7.5" height="44" fill="#16a34a"/><rect x="345.0" y="446" width="7.5" height="44" fill="#16a34a"/><rect x="360.0" y="446" width="7.5" height="44" fill="#16a34a"/><rect x="375.0" y="446" width="7.5" height="44" fill="#16a34a"/><rect x="390.0" y="446" width="7.5" height="44" fill="#16a34a"/><rect x="405.0" y="446" width="7.5" height="44" fill="#16a34a"/><rect x="420.0" y="446" width="7.5" height="44" fill="#16a34a"/><rect x="435.0" y="446" width="7.5" height="44" fill="#16a34a"/><rect x="450.0" y="446" width="7.5" height="44" fill="#16a34a"/><rect x="465.0" y="446" width="7.5" height="44" fill="#16a34a"/><rect x="480.0" y="446" width="7.5" height="44" fill="#16a34a"/><rect x="495.0" y="446" width="7.5" height="44" fill="#16a34a"/><rect x="510.0" y="446" width="7.5" height="44" fill="#16a34a"/><rect x="525.0" y="446" width="7.5" height="44" fill="#16a34a"/><rect x="540.0" y="446" width="7.5" height="44" fill="#16a34a"/><rect x="555.0" y="446" width="7.5" height="44" fill="#16a34a"/><rect x="570.0" y="446" width="7.5" height="44" fill="#16a34a"/><rect x="585.0" y="446" width="7.5" height="44" fill="#16a34a"/><rect x="300" y="446" width="300" height="44" rx="5" fill="none" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="624" y="466" font-size="17" fill="#0f172a">Refused or failed</text>
+<text x="624" y="486" font-size="15" font-weight="bold" fill="#dc2626">read it on the laptop</text>
+<line x1="28" y1="512" x2="912" y2="512" stroke="#eef2f6" stroke-width="1"/>
+<circle cx="52" cy="542" r="13" fill="url(#led)"/>
+<circle cx="52" cy="542" r="13" fill="none" stroke="#15803d" stroke-width="1"/>
+<text x="78" y="540" font-size="21" font-weight="bold" fill="#0f172a">BUSY</text>
+<text x="78" y="560" font-size="14" fill="#64748b">250 ms</text>
+<rect x="300" y="520" width="300" height="44" rx="5" fill="#e2e8f0"/><rect x="300.0" y="520" width="37.5" height="44" fill="#16a34a"/><rect x="375.0" y="520" width="37.5" height="44" fill="#16a34a"/><rect x="450.0" y="520" width="37.5" height="44" fill="#16a34a"/><rect x="525.0" y="520" width="37.5" height="44" fill="#16a34a"/><rect x="300" y="520" width="300" height="44" rx="5" fill="none" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="624" y="540" font-size="17" fill="#0f172a">Another job is still running</text>
+<text x="624" y="560" font-size="15" font-weight="bold" fill="#64748b">wait, retry shortly</text>
+<rect x="28" y="612" width="884" height="52" rx="10" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="46" y="634" font-size="15" fill="#0f172a"><tspan font-weight="bold">K1</tspan> = the physical confirm button.  <tspan font-weight="bold">▶ PRESS K1</tspan> only when READY is blinking (~4&#8239;Hz).</text>
+<text x="46" y="654" font-size="15" fill="#0f172a">A second, <tspan fill="#dc2626" font-weight="bold">red</tspan> LED (sys_led) is the system heartbeat &#8212; steady blink = healthy; ignore it.</text>
+</svg>
