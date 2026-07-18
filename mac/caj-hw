@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# caj-hw — sign a `caj` job with a YubiKey PIV slot-9c key instead of a software key.
+#
+# Wraps the ssh-agent + PKCS#11 setup that `ssh-keygen -Y sign -U` requires (verified 2026-07-18):
+#   * `-Y sign` cannot use a PKCS#11 key directly via `-D` ("No private key found") — it needs
+#     the key in an ssh-agent and `-U`.
+#   * ssh-agent refuses PKCS#11 providers unless allow-listed with `-P`, and it canonicalizes the
+#     path first — so the versioned/symlinked libykcs11 REAL path must be passed to `-P`.
+#   * the plugged token's slot-9c ECDSA pubkey selects which key `-U` signs with.
+# This helper resolves all three, starts a scoped throwaway agent, loads the token (PIN), runs
+# caj (touch), and tears the agent down.
+#
+# Usage: caj-hw build --spec <spec> --stick <mnt> [other caj build args]
+set -euo pipefail
+IFS=$'\n\t'
+
+HARNESS="${NEBULA_CA_HARNESS:-$HOME/nebula-ca-harness}"
+CAJ="$HARNESS/mac/caj"
+LIBYKCS11_LINK="${LIBYKCS11:-/opt/homebrew/lib/libykcs11.dylib}"
+export PYTHONPATH="$HARNESS/box/lib${PYTHONPATH:+:$PYTHONPATH}"
+
+[ -f "$CAJ" ] || { echo "caj-hw: caj not found: $CAJ" >&2; exit 1; }
+[ -e "$LIBYKCS11_LINK" ] || { echo "caj-hw: libykcs11 not found: $LIBYKCS11_LINK (brew install yubico-piv-tool)" >&2; exit 1; }
+
+# ssh-agent -P canonicalizes the provider path, so allow-list the REAL (versioned) path.
+PROVIDER="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$LIBYKCS11_LINK")"
+
+TOKENPUB="$(mktemp -t caj-hw)"
+cleanup() { [ -n "${SSH_AGENT_PID:-}" ] && ssh-agent -k >/dev/null 2>&1 || true; rm -f "$TOKENPUB"; }
+trap cleanup EXIT
+
+# The plugged token's slot-9c ECDSA pubkey selects the key for `ssh-keygen -Y sign -U`.
+ssh-keygen -D "$PROVIDER" 2>/dev/null \
+  | awk '/ecdsa-sha2-nistp256.*Digital Signature/{print $1, $2, "nebula-ca-token"; exit}' > "$TOKENPUB"
+[ -s "$TOKENPUB" ] || { echo "caj-hw: no PIV slot-9c ECDSA key on the plugged token (insert a YubiKey)" >&2; exit 1; }
+echo "caj-hw: signing with token key $(ssh-keygen -lf "$TOKENPUB" | awk '{print $2}')"
+
+# Scoped throwaway agent that allow-lists exactly this provider.
+eval "$(ssh-agent -P "$PROVIDER" -s)" >/dev/null
+ssh-add -s "$PROVIDER"                                   # PIN prompt
+python3 "$CAJ" "$@" --agent --key "$TOKENPUB"            # touch during signing
