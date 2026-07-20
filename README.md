@@ -17,6 +17,7 @@ You prepare a signed "job" on your online laptop, walk the stick over to the air
 - [Building your own](#building-your-own)
 - [Operating the CA](#operating-the-ca)
 - [The operations](#the-operations)
+- [Onboarding devices to the mesh](#onboarding-devices-to-the-mesh)
 - [Repository layout](#repository-layout)
 - [The job lifecycle in detail](#the-job-lifecycle-in-detail)
 - [Testing](#testing)
@@ -158,6 +159,67 @@ Insert a **blank** stick and press K1 twice: the box writes a **recovery kit** (
 | `run-script` | Run an arbitrary operator script — confined as `nebula-job`, or as root only with a break-glass co-sign. |
 
 Overlay range, certificate lifetimes (CA 10 y, host 5 y by default), timeouts, and all size caps are constants in `box/lib/causb/config.py`.
+
+---
+
+## Onboarding devices to the mesh
+
+Every device joins the mesh the same way: **its keypair is generated on the device itself** (the private key never moves), the CA signs its public key through a `sign-hosts` stick round-trip, and then the device gets `ca.crt` + its signed cert + a node config and starts Nebula. Only the last "run it as a service" step differs by OS.
+
+### 1 — Generate the keypair *on the node*
+
+```
+nebula-cert keygen -out-key <name>.key -out-pub <name>.pub
+```
+
+The `.pub` basename becomes the host's mesh name; the `.key` stays on the node and is never copied off it.
+
+### 2 — Sign it (one stick round-trip)
+
+Stage the pubkey next to a spec:
+
+```
+name: sign <name>
+operation: sign-hosts
+payload: <name>.pub
+```
+
+`caj build --spec <spec> --stick <stick>` → carry the stick to the box → press K1 → `caj-recv --stick <stick>`. The signed `<name>.crt` is filed under `hosts/<name>/` and the registry assigns it a stable overlay IP by name.
+
+**Sign many at once.** `payload:` is a comma-separated list (up to 16 hosts per job), so a whole batch of devices can be signed in a single round-trip:
+
+```
+payload: laptop.pub,nas.pub,phone.pub
+```
+
+### 3 — Install `ca.crt` + the cert + a config, then run it
+
+Point each node's `config.yml` at your lighthouse(s) (`static_host_map` + `lighthouse.hosts`, `am_lighthouse: false`, no relay). A node's own overlay IP travels **in its certificate**, not the config. Then run Nebula as a boot service for the platform:
+
+- **Linux (systemd)** — put `ca.crt`, `<name>.crt`, `<name>.key`, and `config.yml` in `/etc/nebula/`; install a `nebula.service`; `systemctl enable --now nebula`.
+- **macOS (LaunchDaemon)** — keep the files in a local directory; install a root LaunchDaemon and `launchctl bootstrap system …` it. Leave `tun.dev` empty so the OS auto-assigns a `utun` device (avoids a "resource busy" crash-loop when other tunnels/VPNs are present).
+- **FreeBSD / TrueNAS** — run Nebula on the host with its files on a persistent pool dataset; supervise it with `daemon(8)`; make it boot-persistent with a POST-INIT init script (on TrueNAS create it via `midclt call initshutdownscript.create`, because hand-edited rc files don't persist there). `tun.dev: nebula1` works.
+- **iOS / Android** — use the Mobile Nebula app; see below.
+
+Verify with `nebula -test`, confirm the interface comes up at the assigned IP, and check the log for handshakes with your lighthouse(s).
+
+### Mobile devices (iOS / Android)
+
+The [Mobile Nebula](https://github.com/DefinedNet/mobile_nebula) app generates the keypair **in the app**, so the round-trip is bookended by it:
+
+1. In the app, add a site and **generate** the key, then copy or export its **public key**.
+2. Sign that pubkey with the CA exactly like any other host (step 2 above) — including as part of a batch — producing `<name>.crt`.
+3. Load the results by **scanning QR codes** in the app: on **Add Certificate → QR Code** scan the cert QR, and on the **CA** screen use **Scan QR** for the `ca.crt` QR. Then enter your lighthouse(s) and enable the site.
+
+A Nebula certificate QR is simply the PEM text, so you can make the app-scannable QR from the already-signed cert on your online machine — no CA key required:
+
+```
+qrencode -o <name>.png < hosts/<name>/<name>.crt
+```
+
+(The CA box can equivalently emit one at signing time via `nebula-cert sign … -out-qr`; the two produce identical content.)
+
+> **Automation note.** `caj`'s spec format passes an `args.<name>` value only as a string or bool, never a list — so the `sign-hosts` handler's per-host options (`mobile`, `groups`, and its built-in `-out-qr`) can't be set through a `caj` spec. Batch jobs therefore use the plain comma-separated `payload:` form, and you generate the mobile QR yourself with `qrencode` as shown above.
 
 ---
 
